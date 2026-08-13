@@ -120,6 +120,15 @@ if (NOT ANDROID)
             rpcs3_lib
     )
 
+    if(TARGET 3rdparty::nvidia_dlss)
+        add_custom_command(TARGET rpcs3 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<IF:$<CONFIG:Debug>,${NVIDIA_DLSS_RUNTIME_DEBUG},${NVIDIA_DLSS_RUNTIME_RELEASE}>"
+                "$<TARGET_FILE_DIR:rpcs3>/nvngx_dlss.dll"
+            COMMENT "Copying the NVIDIA DLSS runtime"
+        )
+    endif()
+
     if(USE_PRECOMPILED_HEADERS)
         target_precompile_headers(rpcs3 PRIVATE stdafx.h)
     endif()

@@ -36,6 +36,7 @@ option(USE_FAUDIO "FAudio audio backend" ON)
 option(USE_LIBEVDEV "libevdev-based joystick support" ON)
 option(USE_DISCORD_RPC "Discord rich presence integration" OFF)
 option(USE_VULKAN "Vulkan render backend" ON)
+option(USE_NVIDIA_DLSS "Enable the experimental NVIDIA DLSS Super Resolution Vulkan path" OFF)
 option(USE_PRECOMPILED_HEADERS "Use precompiled headers" OFF)
 option(USE_SDL "Enables SDL input handler" ON)
 option(USE_SYSTEM_CUBEB "Prefer system cubeb instead of the builtin one" OFF)
@@ -103,6 +104,10 @@ if(MSVC)
 endif()
 
 add_subdirectory(3rdparty)
+
+if(USE_NVIDIA_DLSS)
+    include(NvidiaDLSS)
+endif()
 
 if (DISABLE_LTO)
     if (CMAKE_C_FLAGS)

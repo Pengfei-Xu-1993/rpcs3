@@ -24,8 +24,9 @@ namespace vk
 		VK_REMAP_VIEW_MULTISAMPLED = 0xDEADBEEF,          // Special encoding for multisampled images; returns a multisampled image view
 		VK_IMAGE_CREATE_ALLOW_NULL_RPCS3 = 0x80000000,    // Special flag that allows null images to be created if there is no memory
 		VK_IMAGE_CREATE_SHAREABLE_RPCS3  = 0x40000000,    // Special flag to create a shareable image
+		VK_IMAGE_CREATE_OPTICAL_FLOW_SHAREABLE_RPCS3 = 0x20000000, // Share between graphics and the dedicated optical-flow queue
 
-		VK_IMAGE_CREATE_SPECIAL_FLAGS_RPCS3 = (VK_IMAGE_CREATE_ALLOW_NULL_RPCS3 | VK_IMAGE_CREATE_SHAREABLE_RPCS3)
+		VK_IMAGE_CREATE_SPECIAL_FLAGS_RPCS3 = (VK_IMAGE_CREATE_ALLOW_NULL_RPCS3 | VK_IMAGE_CREATE_SHAREABLE_RPCS3 | VK_IMAGE_CREATE_OPTICAL_FLOW_SHAREABLE_RPCS3)
 	};
 
 	class image : public unique_resource
@@ -63,7 +64,8 @@ namespace vk
 			VkImageUsageFlags usage,
 			VkImageCreateFlags image_flags,
 			vmm_allocation_pool allocation_pool,
-			rsx::format_class format_class = RSX_FORMAT_CLASS_UNDEFINED);
+			rsx::format_class format_class = RSX_FORMAT_CLASS_UNDEFINED,
+			const void* creation_pnext = nullptr);
 
 		virtual ~image();
 
