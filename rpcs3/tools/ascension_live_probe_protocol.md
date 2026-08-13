@@ -50,6 +50,25 @@ Pointer sources are `PPU_R0`..`PPU_R31`, `SPU_R0`..`SPU_R127`,
 `OFFSETN` is applied to the final target. Pointer rules can be changed while
 disarmed, without rebuilding or restarting RPCS3.
 
+`GET_STATS` includes the configured `max_events` together with the runtime
+counts. `SET_MAX_EVENTS` and the legacy `SET_FILTER FIRST_HITS=...` alias are
+rejected while a capture is open, so a bounded controller can verify the limit
+before `START_CAPTURE` and keep it immutable through final close. Accepted-event reservation uses a
+single atomic compare/exchange budget, including with concurrent PPU, SPU, and
+RSX producers; a nonzero limit therefore cannot be exceeded.
+
+For unattended bounded sessions, the controller accepts `--max-events`,
+`--arm-seconds`, and `--authorization-timeout`. It can wait for the exact
+authorized executable before starting the ARM clock. At the first event/time
+limit it performs `DISARM`, waits briefly for in-flight producers, flushes
+until accepted/written/dropped counts converge, then issues `STOP_CAPTURE` and
+stops the RPCS3 process. The ARM limit applies through acknowledged `DISARM`;
+file close, process exit, and analysis occur after event production has stopped.
+An independent pre-deadline watchdog terminates RPCS3 if the control pipe
+stalls. The final `status.json` preserves limits, ARM
+timestamps and duration, stop reason, final probe counts, analyzer result, and
+capture-guard violations; `phase=complete` alone is not a scientific result.
+
 `PPU_PC=0x073c80c` is retained as the initial research filter because that is
 where the verified SPU BRSL bytes occur in the loaded `GOWA.SELF` image. It is
 not yet proven to be an executing PPU producer call site. A capture with SPU

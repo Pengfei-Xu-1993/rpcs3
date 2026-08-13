@@ -1,6 +1,9 @@
 #include "Emu/Cell/AscensionMfcProvenance.h"
+#include "Emu/Cell/AscensionLiveProbeBudget.h"
 
+#include <atomic>
 #include <iostream>
+#include <thread>
 
 namespace
 {
@@ -95,6 +98,33 @@ namespace
 		CHECK(table.record(0x40, 0x1040, 16, 2));
 		CHECK(table.resolve(0x40, 16, 2).age == 0);
 	}
+
+	void test_event_budget_is_strict_under_contention()
+	{
+		constexpr u64 maximum = 1000;
+		std::atomic<u64> accepted{0};
+		std::atomic<u64> successes{0};
+		std::array<std::thread, 8> workers;
+		for (auto& worker : workers)
+		{
+			worker = std::thread([&]
+				{
+					for (u32 attempt = 0; attempt < 4000; ++attempt)
+					{
+						if (ascension::live_probe::try_reserve_event(accepted, maximum))
+							successes.fetch_add(1, std::memory_order_relaxed);
+					}
+				});
+		}
+		for (auto& worker : workers)
+			worker.join();
+		CHECK(accepted.load() == maximum);
+		CHECK(successes.load() == maximum);
+
+		accepted.store(0);
+		CHECK(ascension::live_probe::try_reserve_event(accepted, 0));
+		CHECK(accepted.load() == 1);
+	}
 } // namespace
 
 int main()
@@ -102,6 +132,7 @@ int main()
 	test_basic_range_and_no_unrelated_eviction();
 	test_partial_and_cross_granule_updates();
 	test_boundaries_epoch_and_zero_ea();
+	test_event_budget_is_strict_under_contention();
 	if (failures)
 		return 1;
 	std::cout << "ascension MFC provenance table tests passed\n";

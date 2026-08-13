@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "AscensionLiveProbe.h"
+#include "AscensionLiveProbeBudget.h"
 
 #include "PPUThread.h"
 #include "SPUThread.h"
@@ -428,11 +429,12 @@ namespace ascension::live_probe
 			{
 				return fmt::format(
 					"{\"ok\":true,\"authorized\":%s,\"armed\":%s,\"capturing\":%s,"
-					"\"frame\":%llu,\"observed\":%llu,\"accepted\":%llu,\"filtered\":%llu,"
+					"\"max_events\":%llu,\"frame\":%llu,\"observed\":%llu,\"accepted\":%llu,\"filtered\":%llu,"
 					"\"written\":%llu,\"snapshots\":%llu,\"dropped\":%llu}",
 					executable_authorized.load() ? "true" : "false",
 					armed.load() ? "true" : "false",
 					capturing.load() ? "true" : "false",
+					max_events.load(),
 					current_frame.load(), observed_events.load(), accepted_events.load(), filtered_events.load(),
 					written_events.load(), written_snapshots.load(), dropped_events.load());
 			}
@@ -507,6 +509,8 @@ namespace ascension::live_probe
 				}
 				if (verb == "SET_SAMPLE_RATE" || verb == "SET_MAX_EVENTS" || verb == "SET_STACK_WINDOW")
 				{
+					if (verb == "SET_MAX_EVENTS" && capturing.load(std::memory_order_acquire))
+						return "{\"ok\":false,\"error\":\"STOP_CAPTURE before changing max events\"}";
 					u64 value = 0;
 					if (tokens.size() != 2 || !parse_u64(tokens[1], value))
 						return "{\"ok\":false,\"error\":\"numeric argument required\"}";
@@ -540,6 +544,14 @@ namespace ascension::live_probe
 				}
 				if (verb == "SET_FILTER")
 				{
+					if (capturing.load(std::memory_order_acquire))
+					{
+						for (usz i = 1; i < tokens.size(); ++i)
+						{
+							if (split_token(tokens[i]).first == "FIRST_HITS")
+								return "{\"ok\":false,\"error\":\"STOP_CAPTURE before changing first hits\"}";
+						}
+					}
 					for (usz i = 1; i < tokens.size(); ++i)
 					{
 						auto [key, text] = split_token(tokens[i]);
@@ -735,11 +747,7 @@ namespace ascension::live_probe
 			const u64 observed = probe.observed_events.fetch_add(1, std::memory_order_relaxed);
 			if (observed % probe.sample_rate.load(std::memory_order_relaxed))
 				return false;
-			const u64 maximum = probe.max_events.load(std::memory_order_relaxed);
-			if (maximum && probe.accepted_events.load(std::memory_order_relaxed) >= maximum)
-				return false;
-			probe.accepted_events.fetch_add(1, std::memory_order_relaxed);
-			return true;
+			return try_reserve_event(probe.accepted_events, probe.max_events.load(std::memory_order_relaxed));
 		}
 
 		u64 hash_bytes(const void* data, usz size)

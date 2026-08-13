@@ -10,6 +10,7 @@ import ctypes
 import dataclasses
 import datetime as dt
 import json
+import math
 import os
 import pathlib
 import shutil
@@ -17,6 +18,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from typing import BinaryIO, Callable, Iterable
 
@@ -37,6 +39,25 @@ EVENT_FLAG_AUTHORIZED = 1 << 0
 EVENT_FLAG_MFC_PROVENANCE = 1 << 5
 SNAPSHOT_SPU_LS = 0x100
 SNAPSHOT_PPU_STACK = 0x101
+DEFAULT_MAX_EVENTS = 250_000
+GRACEFUL_STOP_LEAD_SECONDS = 1.0
+WATCHDOG_LEAD_SECONDS = 0.25
+POST_DISARM_QUIESCE_SECONDS = 0.25
+FLUSH_CONVERGENCE_SECONDS = 2.0
+
+
+def _positive_int(text: str) -> int:
+    value = int(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return value
+
+
+def _positive_finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive finite number")
+    return value
 
 
 def _cstring(raw: bytes) -> str:
@@ -502,7 +523,7 @@ DEFAULT_COMMANDS = [
     "SET_FILTER SPU_PC=0x0928c SPU_TARGET=0x0c490 SPU_FORMAT=0x871c0c00 SPU_THREAD=0 SPU_SEQUENCE=0 SPU_SOURCE=0 SPU_OUTPUT=0",
     "SET_FILTER FRAME_START=0 FRAME_END=0xffffffffffffffff RSX_MASK=0xc3b5 RSX_VP=0 RSX_FP=0 RSX_MIN_VERTICES=128 RSX_MAX_VERTICES=8192 RSX_ADDRESS=0 RSX_PRIMITIVE=0xffffffff",
     "SET_SAMPLE_RATE 1",
-    "SET_MAX_EVENTS 250000",
+    f"SET_MAX_EVENTS {DEFAULT_MAX_EVENTS}",
     "SET_REGISTER_SET PPU 0,1,3,4,5,6,7,8,9,10",
     "SET_REGISTER_SET SPU 0,1,3,4,5,6,7,8,12,20,21,23,32,70,72,79,80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95",
     "SET_STACK_WINDOW 128",
@@ -515,6 +536,110 @@ DEFAULT_COMMANDS = [
     "ADD_POINTER_FOLLOW ID=7 SOURCE=PPU_R7 SPACE=GUEST DEPTH=0 OFFSET0=0 SIZE=64",
     "ADD_POINTER_FOLLOW ID=8 SOURCE=PPU_R8 SPACE=GUEST DEPTH=0 OFFSET0=0 SIZE=64",
 ]
+
+
+def _commands_for_max_events(max_events: int) -> list[str]:
+    replacement = f"SET_MAX_EVENTS {max_events}"
+    commands = [
+        replacement if command.startswith("SET_MAX_EVENTS ") else command
+        for command in DEFAULT_COMMANDS
+    ]
+    if commands.count(replacement) != 1:
+        raise RuntimeError("default command list must contain exactly one event limit")
+    return commands
+
+
+def _require_ok(command: str, response: dict[str, object]) -> dict[str, object]:
+    if not response.get("ok"):
+        raise RuntimeError(f"command failed: {command}: {response}")
+    return response
+
+
+def _changes_capture_guard(command: str) -> bool:
+    tokens = command.strip().upper().split()
+    if not tokens:
+        return False
+    if tokens[0] in {"ARM", "DISARM", "START_CAPTURE", "STOP_CAPTURE", "SET_MAX_EVENTS"}:
+        return True
+    return tokens[0] == "SET_FILTER" and any(
+        token.split("=", 1)[0] == "FIRST_HITS" for token in tokens[1:]
+    )
+
+
+def _capture_guard_violations(
+    *,
+    max_events: int,
+    arm_seconds: float | None,
+    arm_duration_seconds: float | None,
+    stop_reason: str | None,
+    final_probe: dict[str, object] | None,
+    capture_exists: bool,
+    analysis_exit_code: int | None,
+    summary_lines: int | None,
+    aggregate: dict[str, object] | None,
+) -> list[str]:
+    violations: list[str] = []
+    if arm_seconds is not None and (
+        arm_duration_seconds is None or arm_duration_seconds > arm_seconds
+    ):
+        violations.append("arm_duration_exceeded_or_missing")
+    if not final_probe:
+        violations.append("missing_final_probe")
+    else:
+        accepted = int(final_probe.get("accepted", -1))
+        written = int(final_probe.get("written", -1))
+        dropped = int(final_probe.get("dropped", -1))
+        if int(final_probe.get("max_events", -1)) != max_events:
+            violations.append("event_limit_configuration_mismatch")
+        if accepted < 0 or accepted > max_events:
+            violations.append("event_limit_exceeded_or_missing")
+        if stop_reason == "max_events" and accepted != max_events:
+            violations.append("event_limit_stop_not_exact")
+        if final_probe.get("armed") or final_probe.get("capturing"):
+            violations.append("probe_not_closed")
+        if final_probe.get("authorized") is not True:
+            violations.append("target_not_authorized")
+        if dropped != 0:
+            violations.append("probe_reported_drops")
+        if accepted != written + dropped:
+            violations.append("probe_counts_not_converged")
+    if not capture_exists:
+        violations.append("capture_missing")
+    if analysis_exit_code != 0:
+        violations.append("analyzer_failed_or_missing")
+    if summary_lines is None or summary_lines > 120:
+        violations.append("bounded_summary_missing_or_oversized")
+    if not aggregate:
+        violations.append("aggregate_report_missing")
+    else:
+        counts = aggregate.get("counts", {})
+        if not isinstance(counts, dict):
+            violations.append("aggregate_counts_missing")
+        else:
+            if int(counts.get("dropped_count", -1)) != 0:
+                violations.append("capture_header_reported_drops")
+            if counts.get("truncated") is not False:
+                violations.append("capture_truncated_or_unknown")
+            required_count_keys = {
+                "ppu_event_count",
+                "spu_task_count",
+                "rsx_draw_count",
+                "snapshot_count",
+            }
+            if not required_count_keys.issubset(counts):
+                violations.append("aggregate_event_counts_missing")
+            if final_probe and required_count_keys.issubset(counts):
+                decoded_events = sum(
+                    int(counts.get(key, 0))
+                    for key in ("ppu_event_count", "spu_task_count", "rsx_draw_count")
+                )
+                if decoded_events != int(final_probe.get("written", -1)):
+                    violations.append("decoded_event_count_mismatch")
+                if int(counts["snapshot_count"]) != int(final_probe.get("snapshots", -1)):
+                    violations.append("decoded_snapshot_count_mismatch")
+    if stop_reason not in {"arm_deadline", "max_events"}:
+        violations.append("unexpected_stop_reason")
+    return violations
 
 
 def _append_jsonl(path: pathlib.Path, item: object) -> None:
@@ -544,6 +669,32 @@ def run_controller(args: argparse.Namespace) -> int:
     executable = pathlib.Path(args.rpcs3).resolve()
     if not executable.is_file():
         raise FileNotFoundError(executable)
+    requested_max_events = getattr(args, "max_events", None)
+    max_events = requested_max_events or DEFAULT_MAX_EVENTS
+    arm_seconds = getattr(args, "arm_seconds", None)
+    authorization_timeout = getattr(args, "authorization_timeout", None)
+    bounded = requested_max_events is not None or arm_seconds is not None
+    graceful_lead = (
+        min(GRACEFUL_STOP_LEAD_SECONDS, arm_seconds / 2.0)
+        if arm_seconds is not None
+        else None
+    )
+    watchdog_lead = (
+        min(
+            WATCHDOG_LEAD_SECONDS,
+            max(0.0, arm_seconds - (graceful_lead or 0.0)) / 2.0,
+        )
+        if arm_seconds is not None
+        else None
+    )
+    limits = {
+        "max_events": max_events,
+        "max_events_enforced": requested_max_events is not None,
+        "arm_seconds": arm_seconds,
+        "authorization_timeout_seconds": authorization_timeout,
+        "graceful_stop_lead_seconds": graceful_lead,
+        "watchdog_lead_seconds": watchdog_lead,
+    }
     root = pathlib.Path(args.session_root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -575,28 +726,102 @@ def run_controller(args: argparse.Namespace) -> int:
     process = subprocess.Popen(command, cwd=executable.parent, env=environment)
     print(f"[live-probe] RPCS3 PID {process.pid}")
     print(f"[live-probe] session: {session}")
-    _write_controller_status(status_path, "waiting_for_pipe", pid=process.pid)
+    _write_controller_status(status_path, "waiting_for_pipe", pid=process.pid, limits=limits)
     controller_error: BaseException | None = None
+    stop_reason: str | None = None
+    armed_at: str | None = None
+    arm_acknowledged_at: str | None = None
+    disarmed_at: str | None = None
+    stopped_at: str | None = None
+    arm_started_monotonic: float | None = None
+    arm_duration_seconds: float | None = None
+    final_probe: dict[str, object] | None = None
+    planned_shutdown = False
+    forced_shutdown = False
+    guard_rejections = 0
+    watchdog_cancel = threading.Event()
+    watchdog_state: dict[str, object] = {"fired": False}
+    watchdog_thread: threading.Thread | None = None
+
+    def record_response(command_text: str, response: dict[str, object]) -> None:
+        _append_jsonl(response_path, {"command": command_text, "response": response})
+
     try:
         with ProbePipe(args.pipe_timeout) as pipe:
-            _write_controller_status(status_path, "configuring", pid=process.pid)
-            responses: list[dict[str, object]] = []
-            responses.append(pipe.command(f'START_CAPTURE path="{capture_path}"'))
-            for command_text in DEFAULT_COMMANDS:
-                response = pipe.command(command_text)
-                responses.append(response)
-                if not response.get("ok"):
-                    raise RuntimeError(f"command failed: {command_text}: {response}")
+            _write_controller_status(status_path, "configuring", pid=process.pid, limits=limits)
+            for command_text in _commands_for_max_events(max_events):
+                response = _require_ok(command_text, pipe.command(command_text))
+                record_response(command_text, response)
                 effective_commands.append(command_text)
                 _write_probe_config(config_path, effective_commands)
-            responses.append(pipe.command("ARM"))
-            for response in responses:
-                _append_jsonl(response_path, response)
-            print("[live-probe] capture is armed; play normally. Runtime commands may be appended to control.in.")
-            _write_controller_status(status_path, "armed", pid=process.pid)
+
+            configured_probe = _require_ok("GET_STATS", pipe.command("GET_STATS"))
+            if int(configured_probe.get("max_events", -1)) != max_events:
+                raise RuntimeError(f"probe did not retain max_events={max_events}: {configured_probe}")
+            if bounded or authorization_timeout is not None:
+                authorization_deadline = time.monotonic() + (authorization_timeout or args.pipe_timeout)
+                while not configured_probe.get("authorized"):
+                    if process.poll() is not None:
+                        raise RuntimeError("RPCS3 exited before the target executable was authorized")
+                    if time.monotonic() >= authorization_deadline:
+                        raise TimeoutError("timed out waiting for the authorized target executable")
+                    _write_controller_status(
+                        status_path,
+                        "waiting_for_authorization",
+                        pid=process.pid,
+                        limits=limits,
+                        probe=configured_probe,
+                    )
+                    time.sleep(0.25)
+                    configured_probe = _require_ok("GET_STATS", pipe.command("GET_STATS"))
+
+            start_command = f'START_CAPTURE path="{capture_path}"'
+            start_response = _require_ok(start_command, pipe.command(start_command))
+            record_response(start_command, start_response)
+            if int(start_response.get("max_events", -1)) != max_events or not start_response.get("capturing"):
+                raise RuntimeError(f"probe did not open with max_events={max_events}: {start_response}")
+
+            armed_at = dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+            arm_started_monotonic = time.monotonic()
+            if arm_seconds is not None:
+                watchdog_delay = max(0.01, arm_seconds - (watchdog_lead or 0.0))
+
+                def enforce_arm_deadline() -> None:
+                    if not watchdog_cancel.wait(watchdog_delay):
+                        watchdog_state["fired"] = True
+                        watchdog_state["fired_at"] = dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+                        watchdog_state["fired_after_seconds"] = time.monotonic() - (arm_started_monotonic or 0.0)
+                        if process.poll() is None:
+                            nonlocal forced_shutdown
+                            forced_shutdown = True
+                            process.terminate()
+
+                watchdog_thread = threading.Thread(
+                    target=enforce_arm_deadline,
+                    name="ascension-probe-arm-watchdog",
+                    daemon=True,
+                )
+                watchdog_thread.start()
+
+            arm_response = _require_ok("ARM", pipe.command("ARM"))
+            record_response("ARM", arm_response)
+            if not arm_response.get("armed"):
+                raise RuntimeError(f"probe did not enter armed state: {arm_response}")
+            arm_acknowledged_at = dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+            print("[live-probe] capture is armed; bounded controller is monitoring it.")
+            _write_controller_status(
+                status_path,
+                "armed",
+                pid=process.pid,
+                limits=limits,
+                armed_at=armed_at,
+                arm_acknowledged_at=arm_acknowledged_at,
+                probe=arm_response,
+            )
 
             control_offset = 0
             next_stats = 0.0
+            next_status = 0.0
             while process.poll() is None:
                 with control_path.open("r", encoding="utf-8") as stream:
                     stream.seek(control_offset)
@@ -604,56 +829,211 @@ def run_controller(args: argparse.Namespace) -> int:
                         command_text = line.strip()
                         if not command_text or command_text.startswith("#"):
                             continue
+                        if bounded and _changes_capture_guard(command_text):
+                            guard_rejections += 1
+                            record_response(
+                                command_text,
+                                {"ok": False, "error": "bounded capture guard is immutable while armed"},
+                            )
+                            continue
                         response = pipe.command(command_text)
                         if response.get("ok"):
                             effective_commands.append(command_text)
                             _write_probe_config(config_path, effective_commands)
-                        _append_jsonl(response_path, {"command": command_text, "response": response})
+                        record_response(command_text, response)
                     control_offset = stream.tell()
-                if time.monotonic() >= next_stats:
-                    status = pipe.command("GET_STATS")
-                    _write_controller_status(status_path, "armed", pid=process.pid, probe=status)
-                    print(f"[live-probe] frame={status.get('frame')} accepted={status.get('accepted')} written={status.get('written')} dropped={status.get('dropped')}")
-                    next_stats = time.monotonic() + 5.0
-                time.sleep(0.25)
+                now = time.monotonic()
+                if watchdog_state.get("fired"):
+                    stop_reason = "arm_watchdog"
+                    break
+                if arm_seconds is not None and arm_started_monotonic is not None:
+                    graceful_deadline = arm_started_monotonic + arm_seconds - (graceful_lead or 0.0)
+                    if now >= graceful_deadline:
+                        stop_reason = "arm_deadline"
+                        break
+                if now >= next_stats:
+                    status = _require_ok("GET_STATS", pipe.command("GET_STATS"))
+                    final_probe = status
+                    if requested_max_events is not None and int(status.get("accepted", 0)) >= max_events:
+                        stop_reason = "max_events"
+                        break
+                    next_stats = time.monotonic() + 0.25
+                    if now >= next_status:
+                        _write_controller_status(
+                            status_path,
+                            "armed",
+                            pid=process.pid,
+                            limits=limits,
+                            armed_at=armed_at,
+                            arm_acknowledged_at=arm_acknowledged_at,
+                            probe=status,
+                        )
+                        print(f"[live-probe] frame={status.get('frame')} accepted={status.get('accepted')} written={status.get('written')} dropped={status.get('dropped')}")
+                        next_status = now + 5.0
+                sleep_for = 0.05
+                if arm_seconds is not None and arm_started_monotonic is not None:
+                    sleep_for = min(sleep_for, max(0.0, graceful_deadline - time.monotonic()))
+                time.sleep(sleep_for)
+
+            if process.poll() is not None and stop_reason is None:
+                if watchdog_state.get("fired"):
+                    stop_reason = "arm_watchdog"
+                    arm_duration_seconds = float(watchdog_state.get("fired_after_seconds", 0.0))
+                else:
+                    stop_reason = "rpcs3_exit"
+
+            if stop_reason in {"arm_deadline", "max_events"} and process.poll() is None:
+                disarm_response = _require_ok("DISARM", pipe.command("DISARM"))
+                record_response("DISARM", disarm_response)
+                disarmed_at = dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+                arm_duration_seconds = time.monotonic() - (arm_started_monotonic or time.monotonic())
+                watchdog_cancel.set()
+                if watchdog_thread is not None:
+                    watchdog_thread.join(timeout=1.0)
+                time.sleep(POST_DISARM_QUIESCE_SECONDS)
+
+                convergence_deadline = time.monotonic() + FLUSH_CONVERGENCE_SECONDS
+                previous_counts: tuple[int, int, int] | None = None
+                stable_count = 0
+                while True:
+                    flush_response = _require_ok("FLUSH", pipe.command("FLUSH"))
+                    record_response("FLUSH", flush_response)
+                    counts = (
+                        int(flush_response.get("accepted", -1)),
+                        int(flush_response.get("written", -1)),
+                        int(flush_response.get("dropped", -1)),
+                    )
+                    stable_count = stable_count + 1 if counts == previous_counts else 1
+                    if counts[0] == counts[1] + counts[2] and stable_count >= 2:
+                        break
+                    if time.monotonic() >= convergence_deadline:
+                        raise RuntimeError(f"capture counters did not converge after DISARM: {flush_response}")
+                    previous_counts = counts
+                    time.sleep(0.05)
+
+                final_probe = _require_ok("STOP_CAPTURE", pipe.command("STOP_CAPTURE"))
+                record_response("STOP_CAPTURE", final_probe)
+                stopped_at = dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+                planned_shutdown = True
+            elif arm_started_monotonic is not None:
+                watchdog_cancel.set()
+                arm_duration_seconds = time.monotonic() - arm_started_monotonic
     except (KeyboardInterrupt, Exception) as error:
         controller_error = error
         print(f"[live-probe] control channel ended: {error}", file=sys.stderr)
-        _write_controller_status(status_path, "controller_error", pid=process.pid, error=str(error))
+        if stop_reason is None:
+            stop_reason = "controller_error"
+        if watchdog_state.get("fired"):
+            stop_reason = "arm_watchdog"
+            arm_duration_seconds = float(watchdog_state.get("fired_after_seconds", 0.0))
+        _write_controller_status(
+            status_path,
+            "controller_error",
+            pid=process.pid,
+            limits=limits,
+            armed_at=armed_at,
+            arm_acknowledged_at=arm_acknowledged_at,
+            arm_duration_seconds=arm_duration_seconds,
+            stop_reason=stop_reason,
+            watchdog=watchdog_state,
+            error=str(error),
+        )
     finally:
-        if controller_error is not None and process.poll() is None:
+        watchdog_cancel.set()
+        if watchdog_thread is not None:
+            watchdog_thread.join(timeout=1.0)
+        if (controller_error is not None or planned_shutdown) and process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=15.0)
             except subprocess.TimeoutExpired:
                 process.kill()
+                process.wait(timeout=5.0)
         exit_code = process.wait()
 
-    log_path = executable.parent / "log" / "RPCS3.log"
-    if log_path.is_file():
-        shutil.copy2(log_path, session / "RPCS3.log")
-    if capture_path.is_file() and capture_path.stat().st_size >= FILE_HEADER_SIZE:
-        analyzer = pathlib.Path(__file__).with_name("ascension_probe_auto_analyzer.py")
-        if analyzer.is_file():
-            subprocess.run(
-                [sys.executable, str(analyzer), str(capture_path), "--output-dir", str(session / "auto-analysis"),
-                 "--top", "10", "--anomaly-limit", "5", "--max-summary-lines", "120"],
-                check=False,
-            )
+    analysis_exit_code: int | None = None
+    aggregate: dict[str, object] | None = None
+    summary_lines: int | None = None
+    postprocess_error: str | None = None
+    try:
+        log_path = executable.parent / "log" / "RPCS3.log"
+        if log_path.is_file():
+            shutil.copy2(log_path, session / "RPCS3.log")
+        if capture_path.is_file() and capture_path.stat().st_size >= FILE_HEADER_SIZE:
+            analyzer = pathlib.Path(__file__).with_name("ascension_probe_auto_analyzer.py")
+            if analyzer.is_file():
+                analysis_process = subprocess.run(
+                    [sys.executable, str(analyzer), str(capture_path), "--output-dir", str(session / "auto-analysis"),
+                     "--top", "10", "--anomaly-limit", "5", "--max-summary-lines", "120"],
+                    check=False,
+                )
+                analysis_exit_code = analysis_process.returncode
+                summary_path = session / "auto-analysis" / "model-summary.txt"
+                aggregate_path = session / "auto-analysis" / "top-candidates.json"
+                if summary_path.is_file():
+                    summary_lines = len(summary_path.read_text(encoding="utf-8").splitlines())
+                if aggregate_path.is_file():
+                    aggregate = json.loads(aggregate_path.read_text(encoding="utf-8"))
+            else:
+                print(f"[live-probe] compact analyzer is missing: {analyzer}", file=sys.stderr)
         else:
-            print(f"[live-probe] compact analyzer is missing: {analyzer}", file=sys.stderr)
-    else:
-        print("[live-probe] no valid capture was produced", file=sys.stderr)
+            print("[live-probe] no valid capture was produced", file=sys.stderr)
+    except Exception as error:
+        postprocess_error = str(error)
+        print(f"[live-probe] post-processing failed: {error}", file=sys.stderr)
+
+    capture_exists = capture_path.is_file()
+    guard_violations = _capture_guard_violations(
+        max_events=max_events,
+        arm_seconds=arm_seconds,
+        arm_duration_seconds=arm_duration_seconds,
+        stop_reason=stop_reason,
+        final_probe=final_probe,
+        capture_exists=capture_exists,
+        analysis_exit_code=analysis_exit_code,
+        summary_lines=summary_lines,
+        aggregate=aggregate,
+    ) if bounded else []
+    operational_failure = (
+        controller_error is not None
+        or postprocess_error is not None
+        or (bounded and not planned_shutdown)
+        or (capture_exists and analysis_exit_code != 0)
+    )
+    guard_failure = bounded and bool(guard_violations)
     _write_controller_status(
         status_path,
-        "complete" if controller_error is None else "failed",
+        "failed" if operational_failure or guard_failure else "complete",
         pid=process.pid,
+        limits=limits,
+        armed_at=armed_at,
+        arm_acknowledged_at=arm_acknowledged_at,
+        disarmed_at=disarmed_at,
+        stopped_at=stopped_at,
+        arm_duration_seconds=arm_duration_seconds,
+        stop_reason=stop_reason,
+        watchdog=watchdog_state,
+        guard_rejections=guard_rejections,
+        final_probe=final_probe,
         rpcs3_exit_code=exit_code,
+        rpcs3_exit_was_controller_requested=planned_shutdown or forced_shutdown or bool(watchdog_state.get("fired")),
         controller_error=str(controller_error) if controller_error is not None else None,
-        capture_exists=capture_path.is_file(),
+        postprocess_error=postprocess_error,
+        capture_exists=capture_exists,
+        analysis_exit_code=analysis_exit_code,
+        aggregate_summary_lines=summary_lines,
+        capture_quality=aggregate.get("counts") if aggregate else None,
+        capture_guard_valid=bounded and not guard_failure and not operational_failure,
+        capture_guard_violations=guard_violations,
     )
     print(f"[live-probe] RPCS3 exit code: {exit_code}; all outputs: {session}")
-    return 1 if controller_error is not None else exit_code
+    if operational_failure:
+        return 1
+    if guard_failure:
+        return 2
+    if planned_shutdown:
+        return 0
+    return exit_code
 
 
 def append_command(args: argparse.Namespace) -> int:
@@ -780,6 +1160,21 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--session-root", required=True)
     run.add_argument("--game", help="optional boot path; omit to select the game in the RPCS3 GUI")
     run.add_argument("--pipe-timeout", type=float, default=90.0)
+    run.add_argument(
+        "--max-events",
+        type=_positive_int,
+        help=f"strict accepted-event limit; probe default is {DEFAULT_MAX_EVENTS}",
+    )
+    run.add_argument(
+        "--arm-seconds",
+        type=_positive_finite_float,
+        help="strict ARM-to-DISARM bound; cleanup and analyzer run after producers stop",
+    )
+    run.add_argument(
+        "--authorization-timeout",
+        type=_positive_finite_float,
+        help="wait this long for the exact authorized title before ARM (boot time is excluded)",
+    )
     run.set_defaults(func=run_controller)
     command = sub.add_parser("command", help="append a runtime command for the active controller")
     command.add_argument("--session-root", required=True)

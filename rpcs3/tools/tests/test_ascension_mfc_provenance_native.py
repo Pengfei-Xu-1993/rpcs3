@@ -81,6 +81,7 @@ class NativeMfcProvenanceTests(unittest.TestCase):
                     [
                         compiler,
                         "-std=c++20",
+                        "-pthread",
                         f"-I{RPCS3_DIR}",
                         str(SOURCE),
                         "-o",
