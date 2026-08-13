@@ -1,6 +1,10 @@
 #include "stdafx.h"
 #include "instance.h"
 
+#ifdef RPCS3_HAS_NVIDIA_DLSS
+#include "../upscalers/dlss_pass.h"
+#endif
+
 namespace vk
 {
 	// Supported extensions
@@ -185,6 +189,10 @@ namespace vk
 				return 0;
 			}
 #endif //(WIN32, __APPLE__)
+
+#ifdef RPCS3_HAS_NVIDIA_DLSS
+			vk::dlss::append_required_instance_extensions(extensions);
+#endif
 			if (g_cfg.video.debug_output)
 				layers.push_back("VK_LAYER_KHRONOS_validation");
 		}

@@ -2,6 +2,11 @@
 #include "instance.h"
 #include "util/logs.hpp"
 #include "Emu/system_config.h"
+
+#ifdef RPCS3_HAS_NVIDIA_DLSS
+#include "../upscalers/dlss_pass.h"
+#endif
+
 #include <vulkan/vulkan_core.h>
 #ifdef __APPLE__
 #include <vulkan/vulkan_beta.h>
@@ -569,6 +574,84 @@ namespace vk
 		}
 #endif
 
+#ifdef RPCS3_HAS_NVIDIA_DLSS
+		const VkInstance dlss_instance = *pgpu;
+		const VkPhysicalDevice dlss_physical_device = *pgpu;
+		const bool dlss_extensions_enabled = vk::dlss::append_required_device_extensions(
+			dlss_instance,
+			dlss_physical_device,
+			requested_extensions);
+
+		VkPhysicalDeviceBufferDeviceAddressFeatures dlss_buffer_device_address_support{
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+		VkPhysicalDeviceFeatures2 dlss_feature_support{
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+			.pNext = &dlss_buffer_device_address_support};
+		vkGetPhysicalDeviceFeatures2(dlss_physical_device, &dlss_feature_support);
+
+		const bool dlss_device_requirements_enabled =
+			dlss_extensions_enabled &&
+			dlss_buffer_device_address_support.bufferDeviceAddress;
+		if (dlss_extensions_enabled && !dlss_buffer_device_address_support.bufferDeviceAddress)
+		{
+			rsx_log.error("NVIDIA DLSS requires Vulkan bufferDeviceAddress support. DLSS will use bilinear fallback.");
+		}
+
+		const auto dlss_supported_extensions = vk::supported_extensions(
+			vk::supported_extensions::enumeration_class::device, nullptr, dlss_physical_device);
+		VkPhysicalDeviceOpticalFlowFeaturesNV dlss_optical_flow_support{
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV};
+		bool dlss_optical_flow_enabled = false;
+		u32 dlss_optical_flow_queue_idx = umax;
+
+		if (dlss_supported_extensions.is_supported(VK_NV_OPTICAL_FLOW_EXTENSION_NAME) &&
+			pgpu->optional_features_support.synchronization_2)
+		{
+			VkPhysicalDeviceFeatures2 optical_flow_feature_query{
+				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+				.pNext = &dlss_optical_flow_support};
+			vkGetPhysicalDeviceFeatures2(dlss_physical_device, &optical_flow_feature_query);
+
+			if (dlss_optical_flow_support.opticalFlow)
+			{
+				for (u32 i = 0; i < pgpu->get_queue_count(); ++i)
+				{
+					const auto& queue_properties = pgpu->get_queue_properties(i);
+					if (queue_properties.queueCount && (queue_properties.queueFlags & VK_QUEUE_OPTICAL_FLOW_BIT_NV))
+					{
+						dlss_optical_flow_queue_idx = i;
+						break;
+					}
+				}
+			}
+
+			dlss_optical_flow_enabled = dlss_optical_flow_queue_idx != umax;
+		}
+
+		if (dlss_optical_flow_enabled)
+		{
+			requested_extensions.push_back(VK_NV_OPTICAL_FLOW_EXTENSION_NAME);
+
+			if (dlss_optical_flow_queue_idx != graphics_queue_idx &&
+				dlss_optical_flow_queue_idx != transfer_queue_idx)
+			{
+				auto& optical_flow_queue = device_queues.emplace_back();
+				optical_flow_queue.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+				optical_flow_queue.pNext = nullptr;
+				optical_flow_queue.flags = 0;
+				optical_flow_queue.queueFamilyIndex = dlss_optical_flow_queue_idx;
+				optical_flow_queue.queueCount = 1;
+				optical_flow_queue.pQueuePriorities = queue_priorities;
+			}
+
+			m_optical_flow_queue_family = dlss_optical_flow_queue_idx;
+		}
+		else
+		{
+			rsx_log.warning("VK_NV_optical_flow is unavailable on a compatible queue. DLSS will use zero motion vectors.");
+		}
+#endif
+
 		enabled_features.robustBufferAccess = VK_TRUE;
 		enabled_features.fullDrawIndexUint32 = VK_TRUE;
 		enabled_features.independentBlend = VK_TRUE;
@@ -706,8 +789,27 @@ namespace vk
 		VkPhysicalDeviceVulkan12Features vulkan12_features{ .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES };
 		vulkan12_features.runtimeDescriptorArray = VK_TRUE;
 		vulkan12_features.uniformBufferStandardLayout = VK_TRUE;
+#ifdef RPCS3_HAS_NVIDIA_DLSS
+		vulkan12_features.bufferDeviceAddress = dlss_device_requirements_enabled ? VK_TRUE : VK_FALSE;
+		if (dlss_device_requirements_enabled)
+		{
+			rsx_log.notice("NVIDIA DLSS Vulkan bufferDeviceAddress support enabled.");
+		}
+#endif
 		vulkan12_features.pNext = const_cast<void*>(device.pNext);
 		device.pNext = &vulkan12_features;
+
+#ifdef RPCS3_HAS_NVIDIA_DLSS
+		VkPhysicalDeviceOpticalFlowFeaturesNV dlss_optical_flow_features{
+			.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV};
+		if (dlss_optical_flow_enabled)
+		{
+			dlss_optical_flow_features.opticalFlow = VK_TRUE;
+			dlss_optical_flow_features.pNext = const_cast<void*>(device.pNext);
+			device.pNext = &dlss_optical_flow_features;
+			rsx_log.notice("NVIDIA Optical Flow enabled on Vulkan queue family %u.", dlss_optical_flow_queue_idx);
+		}
+#endif
 
 		if (pgpu->descriptor_indexing_support)
 		{
@@ -822,6 +924,18 @@ namespace vk
 		vkGetDeviceQueue(dev, graphics_queue_idx, 0, &m_graphics_queue);
 		vkGetDeviceQueue(dev, transfer_queue_idx, transfer_queue_sub_index, &m_transfer_queue);
 
+#ifdef RPCS3_HAS_NVIDIA_DLSS
+		if (dlss_optical_flow_enabled)
+		{
+			if (dlss_optical_flow_queue_idx == graphics_queue_idx)
+				m_optical_flow_queue = m_graphics_queue;
+			else if (dlss_optical_flow_queue_idx == transfer_queue_idx)
+				m_optical_flow_queue = m_transfer_queue;
+			else
+				vkGetDeviceQueue(dev, dlss_optical_flow_queue_idx, 0, &m_optical_flow_queue);
+		}
+#endif
+
 		if (present_queue_idx != umax)
 		{
 			vkGetDeviceQueue(dev, present_queue_idx, 0, &m_present_queue);
@@ -861,6 +975,11 @@ namespace vk
 
 			vkDestroyDevice(dev, nullptr);
 			dev = nullptr;
+			m_graphics_queue = VK_NULL_HANDLE;
+			m_present_queue = VK_NULL_HANDLE;
+			m_transfer_queue = VK_NULL_HANDLE;
+			m_optical_flow_queue = VK_NULL_HANDLE;
+			m_optical_flow_queue_family = umax;
 			memory_map = {};
 			m_formats_support = {};
 		}

@@ -37,6 +37,12 @@ VK_FUNC(vkCmdDrawMultiIndexedEXT);
 // EXT_external_memory_host
 VK_FUNC(vkGetMemoryHostPointerPropertiesEXT);
 
+// NV_optical_flow
+VK_FUNC(vkCreateOpticalFlowSessionNV);
+VK_FUNC(vkDestroyOpticalFlowSessionNV);
+VK_FUNC(vkBindOpticalFlowSessionImageNV);
+VK_FUNC(vkCmdOpticalFlowExecuteNV);
+
 #undef VK_FUNC
 #undef DECLARE_VK_FUNCTION_HEADER
 #undef DECLARE_VK_FUNCTION_BODY

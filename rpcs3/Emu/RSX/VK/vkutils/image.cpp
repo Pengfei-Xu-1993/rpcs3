@@ -56,7 +56,8 @@ namespace vk
 		VkImageUsageFlags usage,
 		VkImageCreateFlags image_flags,
 		vmm_allocation_pool allocation_pool,
-		rsx::format_class format_class)
+		rsx::format_class format_class,
+		const void* creation_pnext)
 		: m_device(dev)
 	{
 		info.imageType = image_type;
@@ -71,29 +72,56 @@ namespace vk
 		info.initialLayout = initial_layout;
 		info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-		std::array<u32, 2> concurrency_queue_families = {
-			dev.get_graphics_queue_family(),
-			dev.get_transfer_queue_family()
+		std::array<u32, 3> concurrency_queue_families{};
+		u32 concurrency_queue_family_count = 0;
+		auto append_queue_family = [&](u32 family)
+		{
+			if (family == umax || std::find(
+				concurrency_queue_families.begin(),
+				concurrency_queue_families.begin() + concurrency_queue_family_count,
+				family) != concurrency_queue_families.begin() + concurrency_queue_family_count)
+			{
+				return;
+			}
+
+			concurrency_queue_families[concurrency_queue_family_count++] = family;
 		};
 
-		if (image_flags & VK_IMAGE_CREATE_SHAREABLE_RPCS3)
+		if (image_flags & (VK_IMAGE_CREATE_SHAREABLE_RPCS3 | VK_IMAGE_CREATE_OPTICAL_FLOW_SHAREABLE_RPCS3))
+		{
+			append_queue_family(dev.get_graphics_queue_family());
+			if (image_flags & VK_IMAGE_CREATE_SHAREABLE_RPCS3)
+				append_queue_family(dev.get_transfer_queue_family());
+			if (image_flags & VK_IMAGE_CREATE_OPTICAL_FLOW_SHAREABLE_RPCS3)
+				append_queue_family(dev.get_optical_flow_queue_family());
+		}
+
+		if (concurrency_queue_family_count > 1)
 		{
 			info.sharingMode = VK_SHARING_MODE_CONCURRENT;
-			info.queueFamilyIndexCount = ::size32(concurrency_queue_families);
+			info.queueFamilyIndexCount = concurrency_queue_family_count;
 			info.pQueueFamilyIndices = concurrency_queue_families.data();
 		}
 
 		VkImageFormatListCreateInfo format_list = { .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO };
+		info.pNext = creation_pnext;
 		if (format.is_mutable())
 		{
 			info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 
 			format_list.pViewFormats = format.pViewFormats;
 			format_list.viewFormatCount = format.viewFormatCount;
+			format_list.pNext = creation_pnext;
 			info.pNext = &format_list;
 		}
 
 		create_impl(dev, access_flags, memory_type, allocation_pool);
+		if (creation_pnext)
+		{
+			// Creation-only extension structures are owned by the caller and may
+			// have stack lifetime. Do not retain a dangling pNext in image::info.
+			info.pNext = nullptr;
+		}
 		m_storage_aspect = get_aspect_flags(format);
 
 		if (format_class == RSX_FORMAT_CLASS_UNDEFINED)

@@ -1118,6 +1118,7 @@ QString emu_settings::GetLocalizedSetting(const QString& original, emu_settings_
 		case output_scaling_mode::nearest: return tr("Nearest", "Output Scaling Mode");
 		case output_scaling_mode::bilinear: return tr("Bilinear", "Output Scaling Mode");
 		case output_scaling_mode::fsr: return tr("FidelityFX Super Resolution 1", "Output Scaling Mode");
+		case output_scaling_mode::dlss: return tr("NVIDIA DLSS Super Resolution (Experimental)", "Output Scaling Mode");
 		}
 		break;
 	case emu_settings_type::AudioRenderer:
