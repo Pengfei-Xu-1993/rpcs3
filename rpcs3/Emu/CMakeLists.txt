@@ -180,6 +180,7 @@ endif()
 # Cell
 target_sources(rpcs3_emu PRIVATE
     Cell/ErrorCodes.cpp
+	Cell/AscensionSpuTaskProbe.cpp
     Cell/MFC.cpp
     Cell/PPUAnalyser.cpp
     Cell/PPUDisAsm.cpp
@@ -496,6 +497,7 @@ target_sources(rpcs3_emu PRIVATE
     RSX/Core/RSXContext.cpp
     RSX/Core/RSXDisplay.cpp
     RSX/Core/RSXDrawCommands.cpp
+    RSX/Core/CharacterVertexProbe.cpp
     RSX/gcm_enums.cpp
     RSX/gcm_printing.cpp
     RSX/GSRender.cpp

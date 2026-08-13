@@ -14,6 +14,7 @@
 
 #include "Emu/Cell/PPUOpcodes.h"
 #include "Emu/Cell/SPUThread.h"
+#include "Emu/Cell/AscensionSpuTaskProbe.h"
 #include "Emu/Cell/PPUAnalyser.h"
 #include "Emu/Cell/timers.hpp"
 
@@ -2328,6 +2329,16 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 	// Apply the patch
 	std::vector<u32> applied;
 	g_fxo->get<patch_engine>().apply(applied, !ar ? hash : std::string{}, [&](u32 addr, u32 size) { return _main.get_ptr<u8>(addr, size);  });
+
+	if (!ar && ascension::spu_task_probe::enabled() &&
+		hash == ascension::spu_task_probe::gowa_112_executable_hash &&
+		ascension::spu_task_probe::install_guest_patch(
+		hash,
+		_main.get_ptr<u8>(ascension::spu_task_probe::embedded_task_call_ppu_address, sizeof(u32)),
+		sizeof(u32)))
+	{
+		applied.push_back(ascension::spu_task_probe::embedded_task_call_ppu_address);
+	}
 
 	if (!ar && !Emu.GetTitleID().empty())
 	{
