@@ -83,7 +83,9 @@ class SPUEvent:
     task_sequence: int
     task_format: int
     packed_count: int
-    descriptor: int
+    # Raw word at task_header_lsa + 0x04. It is preserved for ABI
+    # compatibility but is not a verified guest pointer or identity field.
+    task_header_word_04: int
     auxiliary: int
     source0: int
     source1: int
@@ -263,14 +265,10 @@ def candidate_extractors(capture: Capture) -> dict[str, Callable[[SPUEvent], obj
         "source0.absolute": lambda e: e.source0 or None,
         "source1.absolute": lambda e: e.source1 or None,
         "auxiliary.absolute": lambda e: e.auxiliary or None,
-        "descriptor.absolute": lambda e: e.descriptor or None,
         "output.absolute": lambda e: e.output_start or None,
         "output.page": lambda e: (e.output_start >> 12) if e.output_start else None,
         "output.page_offset": lambda e: (e.output_start & 0xFFF) if e.output_start else None,
         "output.frame_relative": lambda e: e.output_frame_relative if e.output_start else None,
-        "source0-descriptor": lambda e: (e.source0 - e.descriptor) & 0xFFFFFFFF if e.source0 and e.descriptor else None,
-        "source1-descriptor": lambda e: (e.source1 - e.descriptor) & 0xFFFFFFFF if e.source1 and e.descriptor else None,
-        "auxiliary-descriptor": lambda e: (e.auxiliary - e.descriptor) & 0xFFFFFFFF if e.auxiliary and e.descriptor else None,
         "task.sequence": lambda e: e.task_sequence,
         "task.local_occurrence": lambda e: e.occurrence,
     }
@@ -525,6 +523,13 @@ def _write_controller_status(path: pathlib.Path, phase: str, **values: object) -
     temporary.replace(path)
 
 
+def _write_probe_config(path: pathlib.Path, commands: list[str]) -> None:
+    """Persist the exact rule history so local analyzers never guess it."""
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps({"schema_version": 1, "effective_commands": commands}, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
 def run_controller(args: argparse.Namespace) -> int:
     executable = pathlib.Path(args.rpcs3).resolve()
     if not executable.is_file():
@@ -538,7 +543,10 @@ def run_controller(args: argparse.Namespace) -> int:
     control_path = session / "control.in"
     response_path = session / "control-responses.jsonl"
     status_path = session / "status.json"
+    config_path = session / "probe-config.json"
     control_path.write_text("", encoding="utf-8")
+    effective_commands: list[str] = []
+    _write_probe_config(config_path, effective_commands)
     (root / "LATEST.txt").write_text(str(session), encoding="utf-8")
 
     environment = os.environ.copy()
@@ -569,6 +577,8 @@ def run_controller(args: argparse.Namespace) -> int:
                 responses.append(response)
                 if not response.get("ok"):
                     raise RuntimeError(f"command failed: {command_text}: {response}")
+                effective_commands.append(command_text)
+                _write_probe_config(config_path, effective_commands)
             responses.append(pipe.command("ARM"))
             for response in responses:
                 _append_jsonl(response_path, response)
@@ -585,6 +595,9 @@ def run_controller(args: argparse.Namespace) -> int:
                         if not command_text or command_text.startswith("#"):
                             continue
                         response = pipe.command(command_text)
+                        if response.get("ok"):
+                            effective_commands.append(command_text)
+                            _write_probe_config(config_path, effective_commands)
                         _append_jsonl(response_path, {"command": command_text, "response": response})
                     control_offset = stream.tell()
                 if time.monotonic() >= next_stats:
@@ -610,11 +623,15 @@ def run_controller(args: argparse.Namespace) -> int:
     if log_path.is_file():
         shutil.copy2(log_path, session / "RPCS3.log")
     if capture_path.is_file() and capture_path.stat().st_size >= FILE_HEADER_SIZE:
-        capture = read_capture(capture_path)
-        analysis = analyze_capture(capture)
-        (session / "analysis.json").write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
-        (session / "summary.txt").write_text(format_report(analysis), encoding="utf-8")
-        print(format_report(analysis, 5))
+        analyzer = pathlib.Path(__file__).with_name("ascension_probe_auto_analyzer.py")
+        if analyzer.is_file():
+            subprocess.run(
+                [sys.executable, str(analyzer), str(capture_path), "--output-dir", str(session / "auto-analysis"),
+                 "--top", "10", "--anomaly-limit", "5", "--max-summary-lines", "120"],
+                check=False,
+            )
+        else:
+            print(f"[live-probe] compact analyzer is missing: {analyzer}", file=sys.stderr)
     else:
         print("[live-probe] no valid capture was produced", file=sys.stderr)
     _write_controller_status(

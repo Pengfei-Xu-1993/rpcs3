@@ -112,7 +112,10 @@ namespace ascension::live_probe
 		u32 task_sequence = 0;
 		u32 task_format = 0;
 		u32 packed_count = 0;
-		u32 descriptor_ea = 0;
+		// Raw big-endian word at task_header_lsa + 0x04. Earlier probe
+		// revisions mislabeled this as a guest descriptor address; it is not
+		// an identity field and must not be dereferenced as one.
+		u32 task_header_word_04 = 0;
 		u32 source_ea_0 = 0;
 		u32 source_ea_1 = 0;
 		u32 auxiliary_ea = 0;

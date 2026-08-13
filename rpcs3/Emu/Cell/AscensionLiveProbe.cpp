@@ -890,7 +890,7 @@ namespace ascension::live_probe
 				identity.task_sequence,
 				identity.task_format,
 				identity.packed_count,
-				identity.descriptor_ea,
+				identity.task_header_word_04,
 				identity.source_ea_0,
 				identity.source_ea_1,
 				identity.auxiliary_ea,
@@ -1042,10 +1042,10 @@ namespace ascension::live_probe
 			value = spu->_ref<u32>(address);
 			return true;
 		};
-		u32 task_sequence = 0, task_format = 0, packed_count = 0, descriptor_ea = 0;
+		u32 task_sequence = 0, task_format = 0, packed_count = 0, task_header_word_04 = 0;
 		u32 auxiliary = 0, source_0 = 0, source_1 = 0, output_base = 0, output_end = 0;
 		const bool valid =
-			read_ls(task_header_lsa + 0x04, descriptor_ea) &&
+			read_ls(task_header_lsa + 0x04, task_header_word_04) &&
 			read_ls(task_header_lsa + 0x10, task_sequence) &&
 			read_ls(task_header_lsa + 0x18, auxiliary) &&
 			read_ls(task_header_lsa + 0x30, source_0) &&
@@ -1098,7 +1098,9 @@ namespace ascension::live_probe
 		event.words[36] = task_sequence;
 		event.words[37] = task_format;
 		event.words[38] = packed_count;
-		event.words[39] = descriptor_ea;
+		// Keep the ABI slot for old captures, but expose its neutral raw-word
+		// semantics instead of the withdrawn descriptor-EA interpretation.
+		event.words[39] = task_header_word_04;
 		event.words[40] = auxiliary;
 		event.words[41] = source_0;
 		event.words[42] = source_1;
@@ -1123,7 +1125,7 @@ namespace ascension::live_probe
 		identity.task_sequence = task_sequence;
 		identity.task_format = task_format;
 		identity.packed_count = packed_count;
-		identity.descriptor_ea = descriptor_ea;
+		identity.task_header_word_04 = task_header_word_04;
 		identity.source_ea_0 = source_0;
 		identity.source_ea_1 = source_1;
 		identity.auxiliary_ea = auxiliary;
@@ -1162,7 +1164,7 @@ namespace ascension::live_probe
 			candidate.task_sequence = static_cast<u32>(slot.values[4].load(std::memory_order_relaxed));
 			candidate.task_format = static_cast<u32>(slot.values[5].load(std::memory_order_relaxed));
 			candidate.packed_count = static_cast<u32>(slot.values[6].load(std::memory_order_relaxed));
-			candidate.descriptor_ea = static_cast<u32>(slot.values[7].load(std::memory_order_relaxed));
+			candidate.task_header_word_04 = static_cast<u32>(slot.values[7].load(std::memory_order_relaxed));
 			candidate.source_ea_0 = static_cast<u32>(slot.values[8].load(std::memory_order_relaxed));
 			candidate.source_ea_1 = static_cast<u32>(slot.values[9].load(std::memory_order_relaxed));
 			candidate.auxiliary_ea = static_cast<u32>(slot.values[10].load(std::memory_order_relaxed));
@@ -1246,7 +1248,7 @@ namespace ascension::live_probe
 			event.words[18] = draw.task.task_sequence;
 			event.words[19] = draw.task.task_format;
 			event.words[20] = draw.task.packed_count;
-			event.words[21] = draw.task.descriptor_ea;
+			event.words[21] = draw.task.task_header_word_04;
 			event.words[22] = draw.task.source_ea_0;
 			event.words[23] = draw.task.source_ea_1;
 			event.words[24] = draw.task.auxiliary_ea;

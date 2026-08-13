@@ -100,8 +100,11 @@ eight 56-byte pointer-follow results.
 - `values[0..31]`: corresponding scalar lane-3 values.
 - `words[32]`: register count.
 - `words[33..35]`: task-header, task-context, DMA-descriptor LS addresses.
-- `words[36..44]`: task sequence, format, packed count, descriptor EA,
-  auxiliary EA, source EA 0/1, output start/end.
+- `words[36..44]`: task sequence, format, packed count, raw
+  `task_header_lsa + 0x04` word, auxiliary EA, source EA 0/1, output
+  start/end. The raw `+0x04` word is retained for ABI compatibility; it is
+  not a verified guest descriptor address and must not be dereferenced or
+  used as an identity candidate.
 - `words[45]`: pointer-result count.
 
 ### RSX draw event (`type=3`)
@@ -112,7 +115,9 @@ eight 56-byte pointer-follow results.
 - `words[0..17]`: draw sequence, VP/FP IDs, vertex counts, first vertex,
   stream/index addresses and sizes, attribute mask, stride, primitive, command,
   index type and restart state.
-- `words[18..28]`: matched task metadata and output-range overlap.
+- `words[18..28]`: matched task metadata and output-range overlap. In
+  particular, `words[21]` mirrors the raw `task_header_lsa + 0x04` word from
+  the mapped SPU event; it is not a verified EA or identity field.
 - common-header `producer_sequence`: exact SPU event sequence when mapped.
 
 ### Pointer result

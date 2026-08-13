@@ -58,7 +58,9 @@ namespace ascension::spu_task_probe
 			u32 task_sequence = 0;
 			u32 task_format = 0;
 			u32 packed_count = 0;
-			u32 descriptor_ea = 0;
+			// Raw word at task_header_lsa + 0x04. Preserve packet layout, but do
+			// not interpret or export it as a guest descriptor address.
+			u32 task_header_word_04 = 0;
 			u32 auxiliary_ea = 0;
 			u32 source_ea_0 = 0;
 			u32 source_ea_1 = 0;
@@ -275,7 +277,7 @@ namespace ascension::spu_task_probe
 				90, 91, 92, 93, 94, 95, 96, 97, 98, 126};
 			std::string csv =
 				"sequence,host_time_us,rsx_frame_id,spu_id,lv2_id,spu_index,pc,spurs_address,"
-				"task_sequence,task_format,packed_count,descriptor_ea,auxiliary_ea,source_ea_0,source_ea_1,"
+				"task_sequence,task_format,packed_count,task_header_word_04,auxiliary_ea,source_ea_0,source_ea_1,"
 				"output_ea_base,output_ea_end,resource_ea,resource_offset_0,resource_offset_1,chunk_offset,"
 				"output_lsa_base,output_lsa_data,output_lsa_sample,output_lsa_end,output_dma_ea,output_span_after_chunk,"
 				"stack_previous_ea,metadata_flags";
@@ -294,7 +296,7 @@ namespace ascension::spu_task_probe
 					record.sequence, record.host_time_us, record.rsx_frame_id,
 					record.spu_id, record.lv2_id, record.spu_index, record.pc, record.spurs_address,
 					record.task_sequence, record.task_format, record.packed_count,
-					record.descriptor_ea, record.auxiliary_ea, record.source_ea_0, record.source_ea_1,
+					record.task_header_word_04, record.auxiliary_ea, record.source_ea_0, record.source_ea_1,
 					record.output_ea_base, record.output_ea_end, record.resource_ea,
 					record.resource_offset_0, record.resource_offset_1, record.chunk_offset,
 					record.output_lsa_base, record.output_lsa_data, record.output_lsa_sample, record.output_lsa_end,
@@ -602,7 +604,7 @@ namespace ascension::spu_task_probe
 					record.metadata_flags |= 1u << 2;
 
 				bool header_ok = true;
-				header_ok &= read_ls_u32(spu, record.task_header_lsa + 0x04, record.descriptor_ea);
+				header_ok &= read_ls_u32(spu, record.task_header_lsa + 0x04, record.task_header_word_04);
 				header_ok &= read_ls_u32(spu, record.task_header_lsa + 0x10, record.task_sequence);
 				header_ok &= read_ls_u32(spu, record.task_header_lsa + 0x18, record.auxiliary_ea);
 				header_ok &= read_ls_u32(spu, record.task_header_lsa + 0x30, record.source_ea_0);
