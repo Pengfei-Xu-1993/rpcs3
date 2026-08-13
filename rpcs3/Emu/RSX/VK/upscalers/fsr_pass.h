@@ -62,7 +62,8 @@ namespace vk
 			VkImage present_surface,                // Present target. May be VK_NULL_HANDLE for some passes
 			VkImageLayout present_surface_layout,   // Present surface layout, or VK_IMAGE_LAYOUT_UNDEFINED if no present target is provided
 			const VkImageBlit& request,             // Scaling request information
-			rsx::flags32_t mode                     // Mode
+			rsx::flags32_t mode,                    // Mode
+			const upscaler_frame_data* frame_data
 		) override;
 	};
 }

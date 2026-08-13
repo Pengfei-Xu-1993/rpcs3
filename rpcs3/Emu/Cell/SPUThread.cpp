@@ -19,6 +19,7 @@
 
 #include "Emu/Cell/SPUDisAsm.h"
 #include "Emu/Cell/SPUAnalyser.h"
+#include "Emu/Cell/AscensionSpuTaskProbe.h"
 #include "Emu/Cell/SPUThread.h"
 #include "Emu/Cell/SPURecompiler.h"
 #include "Emu/Cell/timers.hpp"
@@ -6494,6 +6495,13 @@ extern void resume_spu_thread_group_from_waiting(spu_thread& spu, std::array<sha
 
 bool spu_thread::stop_and_signal(u32 code)
 {
+	if (ascension::spu_task_probe::handle_stop(*this, code))
+	{
+		// The probe emulated the overwritten BRSL and selected the call target.
+		// Returning false makes every SPU backend redispatch at that PC.
+		return false;
+	}
+
 	auto set_status_npc = [&]()
 	{
 		status_npc.atomic_op([&](status_npc_sync_var& state)

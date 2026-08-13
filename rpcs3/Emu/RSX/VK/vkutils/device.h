@@ -148,10 +148,12 @@ namespace vk
 		VkQueue m_graphics_queue = VK_NULL_HANDLE;
 		VkQueue m_present_queue = VK_NULL_HANDLE;
 		VkQueue m_transfer_queue = VK_NULL_HANDLE;
+		VkQueue m_optical_flow_queue = VK_NULL_HANDLE;
 
 		u32 m_graphics_queue_family = 0;
 		u32 m_present_queue_family = 0;
 		u32 m_transfer_queue_family = 0;
+		u32 m_optical_flow_queue_family = umax;
 
 		void dump_debug_info(
 			const std::vector<const char*>& requested_extensions,
@@ -198,9 +200,12 @@ namespace vk
 		VkQueue get_present_queue() const { return m_present_queue; }
 		VkQueue get_graphics_queue() const { return m_graphics_queue; }
 		VkQueue get_transfer_queue() const { return m_transfer_queue; }
+		VkQueue get_optical_flow_queue() const { return m_optical_flow_queue; }
 		u32 get_graphics_queue_family() const { return m_graphics_queue_family; }
 		u32 get_present_queue_family() const { return m_graphics_queue_family; }
 		u32 get_transfer_queue_family() const { return m_transfer_queue_family; }
+		u32 get_optical_flow_queue_family() const { return m_optical_flow_queue_family; }
+		bool get_optical_flow_support() const { return m_optical_flow_queue != VK_NULL_HANDLE; }
 
 		mem_allocator_base* get_allocator() const { return m_allocator.get(); }
 

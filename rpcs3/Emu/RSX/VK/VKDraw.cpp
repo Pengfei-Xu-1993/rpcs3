@@ -1,5 +1,7 @@
 #include "stdafx.h"
+#include "Emu/Cell/AscensionSpuTaskProbe.h"
 #include "../Common/BufferUtils.h"
+#include "../Core/CharacterVertexProbe.h"
 #include "../Program/GLSLCommon.h"
 #include "../rsx_methods.h"
 
@@ -1003,6 +1005,131 @@ void VKGSRender::emit_geometry(u32 sub_index)
 		return;
 	}
 
+	if ((rsx::character_vertex_probe::spu_writer_enabled() || rsx::character_vertex_probe::rsx_draw_enabled()) && m_vertex_prog &&
+		m_vertex_layout.attribute_mask == 0xc3b5 &&
+		upload_info.vertex_draw_count >= 128 && upload_info.vertex_draw_count <= 8192 &&
+		draw_call.primitive >= rsx::primitive_type::triangles && draw_call.primitive <= rsx::primitive_type::polygon)
+	{
+		std::span<const std::byte> raw_index_buffer;
+		u32 index_address = 0;
+		u8 index_type = 0xff;
+		if (draw_call.command == rsx::draw_command::indexed)
+		{
+			raw_index_buffer = m_draw_processor.get_raw_index_array(draw_call);
+			const auto raw_index_type = draw_call.is_immediate_draw
+				? rsx::index_array_type::u32
+				: rsx::method_registers.index_type();
+			index_type = static_cast<u8>(raw_index_type);
+			if (!draw_call.is_immediate_draw)
+			{
+				const u32 type_size = get_index_type_size(raw_index_type);
+				index_address = ((0u - type_size) & rsx::get_address(
+					rsx::method_registers.index_array_address(),
+					rsx::method_registers.index_array_location())) + draw_call.min_index() * type_size;
+			}
+		}
+
+		for (const auto* block : m_vertex_layout.interleaved_blocks)
+		{
+			const bool contains_position = std::any_of(block->locations.begin(), block->locations.end(), [](const auto& location)
+			{
+				return location.index == 0;
+			});
+
+			if (!contains_position || !block->attribute_stride || !block->vertex_range.second)
+				continue;
+
+			const u64 address = static_cast<u64>(block->real_offset_address) +
+				static_cast<u64>(block->vertex_range.first) * block->attribute_stride;
+			const u64 size = static_cast<u64>(block->vertex_range.second) * block->attribute_stride;
+			if (address <= umax && size <= umax)
+			{
+				ascension::spu_task_probe::output_identity task_identity{};
+				const bool has_task_identity = ascension::spu_task_probe::identify_output_range(
+					static_cast<u32>(address),
+					static_cast<u32>(size),
+					task_identity);
+				if (rsx::character_vertex_probe::task_identity_required() && !has_task_identity)
+					continue;
+
+				if (rsx::character_vertex_probe::spu_writer_enabled())
+				{
+					rsx::character_vertex_probe::watch_vertex_range(
+						vk::get_current_frame_id(),
+						m_vertex_prog->id,
+						upload_info.vertex_draw_count,
+						m_vertex_layout.attribute_mask,
+						block->attribute_stride,
+						static_cast<u32>(address),
+						static_cast<u32>(size));
+				}
+				else
+				{
+					rsx::character_vertex_probe::rsx_draw_desc desc{};
+					desc.frame_id = vk::get_current_frame_id();
+					desc.vertex_program_id = m_vertex_prog->id;
+					desc.fragment_program_id = m_fragment_prog ? m_fragment_prog->id : 0;
+					desc.vertex_draw_count = upload_info.vertex_draw_count;
+					desc.stream_vertex_count = block->vertex_range.second;
+					desc.first_vertex = block->vertex_range.first;
+					desc.stream_address = static_cast<u32>(address);
+					desc.stream_size = static_cast<u32>(size);
+					desc.index_address = index_address;
+					desc.index_count = raw_index_buffer.empty() ? 0 : static_cast<u32>(raw_index_buffer.size_bytes() / get_index_type_size(static_cast<rsx::index_array_type>(index_type)));
+					desc.attribute_mask = m_vertex_layout.attribute_mask;
+					desc.stride = block->attribute_stride;
+					desc.primitive = static_cast<u8>(draw_call.primitive);
+					desc.command = static_cast<u8>(draw_call.command);
+					desc.index_type = index_type;
+					desc.indexed_constants = m_vertex_prog->has_indexed_constants || m_shader_interpreter.is_interpreter(m_program);
+					desc.restart_index_enabled = rsx::method_registers.restart_index_enabled();
+					desc.restart_index = rsx::method_registers.restart_index();
+					if (has_task_identity)
+					{
+						desc.task_sequence = task_identity.task_sequence;
+						desc.task_format = task_identity.task_format;
+						desc.task_packed_count = task_identity.packed_count;
+						desc.task_source_ea = task_identity.source_ea_0;
+						desc.task_output_relative_offset = task_identity.output_relative_offset;
+						desc.task_overlap_bytes = task_identity.overlap_bytes;
+						desc.task_identity_valid = true;
+					}
+
+					for (const auto& location : block->locations)
+					{
+						if (desc.attribute_count >= desc.attributes.size())
+							break;
+						const auto& format = rsx::method_registers.vertex_arrays_info[location.index];
+						const u32 attribute_address = format.offset() & 0x7fffffffu;
+						if (attribute_address < block->base_offset)
+							continue;
+
+						auto& attribute = desc.attributes[desc.attribute_count++];
+						attribute.index = location.index;
+						attribute.type = static_cast<u8>(format.type());
+						attribute.component_count = format.size();
+						attribute.byte_size = static_cast<u8>(rsx::get_vertex_type_size_on_host(format.type(), format.size()));
+						attribute.offset = static_cast<u16>(attribute_address - block->base_offset);
+						attribute.frequency = location.frequency;
+						attribute.modulo = location.modulo;
+					}
+
+					rsx::character_vertex_probe::observe_rsx_draw(
+						desc,
+						vm::_ptr<const u8>(desc.stream_address),
+						raw_index_buffer.data(),
+						static_cast<u32>(raw_index_buffer.size_bytes()),
+						rsx::method_registers.transform_constants.data(),
+						m_vertex_prog->constant_ids.data(),
+						::size32(m_vertex_prog->constant_ids));
+				}
+			}
+		}
+	}
+
+	rsx::character_vertex_probe::report(vk::get_current_frame_id());
+	ascension::spu_task_probe::report(vk::get_current_frame_id());
+
 	m_frame_stats.vertex_upload_time += m_profiler.duration();
 
 	// Faults are allowed during vertex upload. Ensure consistent CB state after uploads.
@@ -1344,6 +1471,7 @@ void VKGSRender::end()
 
 	auto& draw_call = rsx::method_registers.current_draw_clause;
 	draw_call.begin();
+	observe_temporal_camera_state();
 	do
 	{
 		emit_geometry(sub_index++);
