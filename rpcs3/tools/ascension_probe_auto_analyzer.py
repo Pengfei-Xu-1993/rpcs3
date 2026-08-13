@@ -9,6 +9,7 @@ metrics only: a bounded summary, Top-N candidates, and capped anomaly classes.
 from __future__ import annotations
 
 import argparse
+import bisect
 import collections
 import dataclasses
 import json
@@ -29,6 +30,10 @@ MAX_COLLISION = 0.05
 MIN_STABILITY = 0.95
 MIN_PAIR_RATE = 0.90
 MIN_ARENA_SURVIVAL = 0.90
+MAX_PPU_CALLSITE_AGGREGATES = 8
+PPU_JOIN_WINDOW_US = 50_000
+PPU_POINTER_CANDIDATE = re.compile(r"^nearest_ppu\.pointer\[(\d+)]\.")
+PPU_REGISTER_CANDIDATE = re.compile(r"^nearest_ppu\.r(\d+)(?:$|\.)")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -39,11 +44,19 @@ class CandidateSpec:
     complexity_penalty: float = 1.0
 
 
-def _pointer(event: probe.SPUEvent, rule_id: int) -> probe.PointerResult | None:
+def _pointer(
+    event: probe.SPUEvent | probe.PPUEvent, rule_id: int
+) -> probe.PointerResult | None:
     return next(
         (item for item in event.pointers if item.rule_id == rule_id and item.flags),
         None,
     )
+
+
+def _nearest_ppu_pointer(
+    event: probe.SPUEvent, rule_id: int
+) -> probe.PointerResult | None:
+    return _pointer(event.nearest_ppu, rule_id) if event.nearest_ppu else None
 
 
 def _nonzero(value: int) -> int | None:
@@ -124,7 +137,132 @@ def _candidate_specs(capture: probe.Capture) -> list[CandidateSpec]:
             0.92,
         )
 
-    rule_ids = sorted({item.rule_id for event in capture.spu for item in event.pointers})
+    ppu_rule_ids = sorted(
+        {
+            item.rule_id
+            for event in capture.ppu
+            for item in event.pointers
+            if item.flags
+        }
+    )
+    for rule_id in ppu_rule_ids:
+        add(
+            f"nearest_ppu.pointer[{rule_id}].source",
+            "ppu_pointer_source",
+            lambda e, rule_id=rule_id: (
+                item.source
+                if (item := _nearest_ppu_pointer(e, rule_id))
+                else None
+            ),
+            0.91,
+        )
+        add(
+            f"nearest_ppu.pointer[{rule_id}].address",
+            "ppu_pointer_address",
+            lambda e, rule_id=rule_id: (
+                item.address
+                if (item := _nearest_ppu_pointer(e, rule_id))
+                else None
+            ),
+            0.92,
+        )
+        add(
+            f"nearest_ppu.pointer[{rule_id}].address.page",
+            "ppu_pointer_address",
+            lambda e, rule_id=rule_id: (
+                item.address >> 12
+                if (item := _nearest_ppu_pointer(e, rule_id)) and item.address
+                else None
+            ),
+            0.90,
+        )
+        add(
+            f"nearest_ppu.pointer[{rule_id}].address.low12",
+            "ppu_pointer_address",
+            lambda e, rule_id=rule_id: (
+                item.address & 0xFFF
+                if (item := _nearest_ppu_pointer(e, rule_id)) and item.address
+                else None
+            ),
+            0.90,
+        )
+        add(
+            f"nearest_ppu.pointer[{rule_id}].address-source",
+            "ppu_pointer_address",
+            lambda e, rule_id=rule_id: (
+                (item.address - item.source) & 0xFFFFFFFF
+                if (item := _nearest_ppu_pointer(e, rule_id))
+                and item.address
+                and item.source
+                else None
+            ),
+            0.89,
+        )
+        add(
+            f"nearest_ppu.pointer[{rule_id}].content_hash",
+            "ppu_pointer_target_hash",
+            lambda e, rule_id=rule_id: (
+                item.content_hash
+                if (item := _nearest_ppu_pointer(e, rule_id))
+                else None
+            ),
+            0.88,
+        )
+        for offset in range(0, 16, 4):
+            add(
+                f"nearest_ppu.pointer[{rule_id}].be32+0x{offset:x}",
+                "ppu_pointer_field",
+                lambda e, rule_id=rule_id, offset=offset: (
+                    int.from_bytes(item.sample[offset:offset + 4], "big")
+                    if (item := _nearest_ppu_pointer(e, rule_id))
+                    and item.captured_size >= offset + 4
+                    else None
+                ),
+                0.87,
+            )
+            add(
+                f"nearest_ppu.pointer[{rule_id}].le32+0x{offset:x}",
+                "ppu_pointer_field",
+                lambda e, rule_id=rule_id, offset=offset: (
+                    int.from_bytes(item.sample[offset:offset + 4], "little")
+                    if (item := _nearest_ppu_pointer(e, rule_id))
+                    and item.captured_size >= offset + 4
+                    else None
+                ),
+                0.85,
+            )
+        for offset in (0, 8):
+            add(
+                f"nearest_ppu.pointer[{rule_id}].be64+0x{offset:x}",
+                "ppu_pointer_field",
+                lambda e, rule_id=rule_id, offset=offset: (
+                    int.from_bytes(item.sample[offset:offset + 8], "big")
+                    if (item := _nearest_ppu_pointer(e, rule_id))
+                    and item.captured_size >= offset + 8
+                    else None
+                ),
+                0.84,
+            )
+            add(
+                f"nearest_ppu.pointer[{rule_id}].le64+0x{offset:x}",
+                "ppu_pointer_field",
+                lambda e, rule_id=rule_id, offset=offset: (
+                    int.from_bytes(item.sample[offset:offset + 8], "little")
+                    if (item := _nearest_ppu_pointer(e, rule_id))
+                    and item.captured_size >= offset + 8
+                    else None
+                ),
+                0.83,
+            )
+
+    rule_ids = sorted(
+        {
+            item.rule_id
+            for event in capture.spu
+            for item in event.pointers
+            if item.flags
+        }
+    )
     for rule_id in rule_ids:
         add(
             f"pointer[{rule_id}].source",
@@ -359,7 +497,7 @@ def _score_spec(
         reject_reasons.append("pipeline_metadata_only")
     if spec.category == "sequence_metadata":
         reject_reasons.append("sequence_counter_only")
-    if spec.category in {"ppu_register", "ppu_register_normalized"}:
+    if spec.category.startswith("ppu_"):
         reject_reasons.append("weak_temporal_join")
 
     identity_factors = [
@@ -476,6 +614,79 @@ def _aggregate_anomalies(
     return [entry for kind in sorted(by_kind) for entry in by_kind[kind]]
 
 
+def _nearest_rank(values: list[int], fraction: float) -> int | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * fraction) - 1))
+    return ordered[index]
+
+
+def _ppu_join_diagnostics(
+    capture: probe.Capture, ranking: list[dict[str, object]]
+) -> dict[str, object]:
+    """Summarize temporal-join quality without exposing event payloads."""
+
+    ppu_times = sorted(event.time_us for event in capture.ppu)
+    deltas: list[int] = []
+    window_counts: list[int] = []
+    nearest_sequences: list[int] = []
+    for event in capture.spu:
+        right = bisect.bisect_right(ppu_times, event.time_us)
+        left = bisect.bisect_left(
+            ppu_times, event.time_us - PPU_JOIN_WINDOW_US, 0, right
+        )
+        window_counts.append(right - left)
+        if event.nearest_ppu is not None:
+            deltas.append(event.time_us - event.nearest_ppu.time_us)
+            nearest_sequences.append(event.nearest_ppu.sequence)
+
+    reuse = collections.Counter(nearest_sequences)
+    best_candidate = next(
+        (
+            item
+            for item in ranking
+            if str(item["category"]).startswith("ppu_")
+        ),
+        None,
+    )
+    best_pointer_by_rule: dict[int, dict[str, object]] = {}
+    for item in ranking:
+        match = PPU_POINTER_CANDIDATE.match(str(item["candidate"]))
+        if match:
+            best_pointer_by_rule.setdefault(int(match.group(1)), item)
+    best_pointer_candidates = [
+        best_pointer_by_rule[rule_id] for rule_id in sorted(best_pointer_by_rule)
+    ]
+    best_argument_by_register: dict[int, dict[str, object]] = {}
+    for item in ranking:
+        match = PPU_REGISTER_CANDIDATE.match(str(item["candidate"]))
+        if match:
+            register = int(match.group(1))
+            if 3 <= register <= 10:
+                best_argument_by_register.setdefault(register, item)
+    best_argument_candidates = [
+        best_argument_by_register[register]
+        for register in sorted(best_argument_by_register)
+    ]
+    return {
+        "window_us": PPU_JOIN_WINDOW_US,
+        "spu_with_nearest_ppu": len(deltas),
+        "coverage": (len(deltas) / len(capture.spu)) if capture.spu else None,
+        "delta_us_p50": _nearest_rank(deltas, 0.50),
+        "delta_us_p95": _nearest_rank(deltas, 0.95),
+        "delta_us_max": max(deltas) if deltas else None,
+        "preceding_ppu_count_p50": _nearest_rank(window_counts, 0.50),
+        "preceding_ppu_count_p95": _nearest_rank(window_counts, 0.95),
+        "preceding_ppu_count_max": max(window_counts) if window_counts else None,
+        "distinct_nearest_ppu": len(reuse),
+        "maximum_spu_reuse": max(reuse.values()) if reuse else 0,
+        "best_candidate": best_candidate,
+        "best_argument_candidates": best_argument_candidates,
+        "best_pointer_candidates": best_pointer_candidates,
+    }
+
+
 def _compact_from_ranking(
     capture: probe.Capture,
     ranking: list[dict[str, object]],
@@ -487,6 +698,7 @@ def _compact_from_ranking(
     accepted = sum(item["decision"] == "accept" for item in ranking)
     target = str(capture.header.get("title_id", ""))[:32]
     version = str(capture.header.get("app_version", ""))[:16]
+    ppu_callsites = collections.Counter(event.pc for event in capture.ppu)
     return {
         "schema_version": 1,
         "target": {"title_id": target, "app_version": version},
@@ -498,6 +710,13 @@ def _compact_from_ranking(
             "dropped_count": int(capture.header.get("dropped_events", 0) or 0),
             "truncated": bool(capture.truncated),
         },
+        "ppu_callsites": [
+            {"pc": f"0x{pc:08x}", "count": count}
+            for pc, count in sorted(
+                ppu_callsites.items(), key=lambda item: (-item[1], item[0])
+            )[:MAX_PPU_CALLSITE_AGGREGATES]
+        ],
+        "ppu_join": _ppu_join_diagnostics(capture, ranking),
         "filters": {
             "generated": len(ranking),
             "accepted": accepted,
@@ -539,7 +758,10 @@ def format_model_summary(result: dict[str, object], max_lines: int = 120) -> str
     max_lines = max(4, int(max_lines))
     counts = result["counts"]
     filters = result["filters"]
+    ppu_join = result["ppu_join"]
     target = result["target"]
+    fmt_percent = lambda value: "n/e" if value is None else f"{value:.1%}"
+    fmt_value = lambda value: "n/e" if value is None else str(value)
     lines = [
         "Ascension local analyzer - model summary",
         f"target: {target['title_id']} v{target['app_version']}",
@@ -548,10 +770,55 @@ def format_model_summary(result: dict[str, object], max_lines: int = 120) -> str
             f"PPU={counts['ppu_event_count']} SPU={counts['spu_task_count']} "
             f"RSX={counts['rsx_draw_count']} snapshots={counts['snapshot_count']}"
         ),
+        "PPU callsites (aggregate): "
+        + (
+            ", ".join(
+                f"{item['pc']}={item['count']}" for item in result["ppu_callsites"]
+            )
+            or "none"
+        ),
+        (
+            "PPU->SPU temporal join: "
+            f"coverage={fmt_percent(ppu_join['coverage'])} "
+            f"delta-us p50/p95/max={fmt_value(ppu_join['delta_us_p50'])}/"
+            f"{fmt_value(ppu_join['delta_us_p95'])}/{fmt_value(ppu_join['delta_us_max'])} "
+            f"preceding-{ppu_join['window_us']}us p50/p95/max="
+            f"{fmt_value(ppu_join['preceding_ppu_count_p50'])}/"
+            f"{fmt_value(ppu_join['preceding_ppu_count_p95'])}/"
+            f"{fmt_value(ppu_join['preceding_ppu_count_max'])}"
+        ),
         f"quality: dropped={counts['dropped_count']} truncated={counts['truncated']}",
         f"candidates: generated={filters['generated']} accepted={filters['accepted']} rejected={filters['rejected']}",
         "Top candidates (aggregate metrics only):",
     ]
+    best_ppu = ppu_join["best_candidate"]
+    if best_ppu is not None and len(lines) < max_lines:
+        lines.insert(
+            -1,
+            f"Best PPU-derived candidate: {best_ppu['candidate']} [{best_ppu['decision']}] "
+            f"score={best_ppu['score']:.4f} support={best_ppu['samples']}; "
+            f"reasons={','.join(best_ppu['reject_reasons']) or 'none'}",
+        )
+    for best_ppu_argument in ppu_join["best_argument_candidates"]:
+        if len(lines) >= max_lines:
+            break
+        lines.insert(
+            -1,
+            f"Best PPU argument candidate: {best_ppu_argument['candidate']} "
+            f"[{best_ppu_argument['decision']}] score={best_ppu_argument['score']:.4f} "
+            f"support={best_ppu_argument['samples']}; "
+            f"reasons={','.join(best_ppu_argument['reject_reasons']) or 'none'}",
+        )
+    for best_ppu_pointer in ppu_join["best_pointer_candidates"]:
+        if len(lines) >= max_lines:
+            break
+        lines.insert(
+            -1,
+            f"Best PPU pointer candidate: {best_ppu_pointer['candidate']} "
+            f"[{best_ppu_pointer['decision']}] score={best_ppu_pointer['score']:.4f} "
+            f"support={best_ppu_pointer['samples']}; "
+            f"reasons={','.join(best_ppu_pointer['reject_reasons']) or 'none'}",
+        )
     for index, item in enumerate(result["top_candidates"], 1):
         if len(lines) + 2 > max_lines:
             break
@@ -788,6 +1055,8 @@ def write_compact_outputs(
             "schema_version": result["schema_version"],
             "target": result["target"],
             "counts": result["counts"],
+            "ppu_callsites": result["ppu_callsites"],
+            "ppu_join": result["ppu_join"],
             "filters": result["filters"],
             "top_candidates": result["top_candidates"],
         },

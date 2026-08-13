@@ -234,6 +234,102 @@ class CompactOutputContractTests(unittest.TestCase):
         for candidate in result["top_candidates"]:
             self.assertTrue(required.issubset(candidate), candidate)
 
+    def test_ppu_callsites_are_bounded_aggregate_counts(self) -> None:
+        pcs = [0x6624BC, 0x6624BC, 0x6624FC]
+        self.capture.ppu = [
+            probe.PPUEvent(
+                sequence=index,
+                time_us=1_000_000 + index,
+                frame=1,
+                thread=1,
+                pc=pc,
+                caller=0,
+                target=0,
+                registers={7: SECRET_TOKEN_BASE + index},
+                stack_address=0,
+                stack=SECRET_SAMPLE,
+                pointers=_pointer(SECRET_TOKEN_BASE + index),
+            )
+            for index, pc in enumerate(pcs, 1)
+        ]
+
+        result = compact.analyze_capture_compact(
+            self.capture, top_n=3, anomaly_limit=1
+        )
+        self.assertEqual(
+            result["ppu_callsites"],
+            [
+                {"pc": "0x006624bc", "count": 2},
+                {"pc": "0x006624fc", "count": 1},
+            ],
+        )
+        summary = compact.format_model_summary(result, max_lines=24)
+        self.assertIn(
+            "PPU callsites (aggregate): 0x006624bc=2, 0x006624fc=1",
+            summary,
+        )
+        self.assertNotIn(SECRET_SAMPLE.decode("ascii"), summary)
+        self.assertNotIn(str(SECRET_TOKEN_BASE), summary)
+
+    def test_ppu_temporal_join_reports_aggregate_ambiguity_only(self) -> None:
+        ppu_events: list[probe.PPUEvent] = []
+        sequence = 10_000
+        for event in self.capture.spu:
+            for delta_us in (80, 50):
+                ppu_events.append(
+                    probe.PPUEvent(
+                        sequence=sequence,
+                        time_us=event.time_us - delta_us,
+                        frame=event.frame,
+                        thread=1,
+                        pc=0x41CACC,
+                        caller=0,
+                        target=0,
+                        registers={3: SECRET_TOKEN_BASE + event.thread},
+                        stack_address=0,
+                        stack=SECRET_SAMPLE,
+                        pointers=_pointer(
+                            SECRET_TOKEN_BASE + event.thread, rule_id=5
+                        ),
+                    )
+                )
+                sequence += 1
+        self.capture.ppu = ppu_events
+        probe._decorate_events(self.capture)
+
+        result = compact.analyze_capture_compact(
+            self.capture, top_n=3, anomaly_limit=1
+        )
+        join = result["ppu_join"]
+        self.assertEqual(join["coverage"], 1.0)
+        self.assertEqual(join["delta_us_p50"], 50)
+        self.assertEqual(join["delta_us_p95"], 50)
+        self.assertGreaterEqual(join["preceding_ppu_count_p50"], 2)
+        self.assertIsNotNone(join["best_candidate"])
+        self.assertEqual(len(join["best_argument_candidates"]), 1)
+        self.assertEqual(len(join["best_pointer_candidates"]), 1)
+        self.assertIn(
+            "weak_temporal_join", join["best_candidate"]["reject_reasons"]
+        )
+
+        all_candidates = compact.analyze_capture_compact(
+            self.capture, top_n=1000, anomaly_limit=1
+        )["top_candidates"]
+        ppu_pointer = next(
+            item
+            for item in all_candidates
+            if item["candidate"] == "nearest_ppu.pointer[5].address"
+        )
+        self.assertIn("weak_temporal_join", ppu_pointer["reject_reasons"])
+
+        summary = compact.format_model_summary(result, max_lines=24)
+        self.assertIn("PPU->SPU temporal join:", summary)
+        self.assertIn("Best PPU-derived candidate:", summary)
+        self.assertIn("Best PPU argument candidate:", summary)
+        self.assertIn("Best PPU pointer candidate:", summary)
+        self.assertNotIn(SECRET_SAMPLE.decode("ascii"), summary)
+        self.assertNotIn(str(SECRET_TOKEN_BASE), summary)
+
     def test_compact_analysis_is_a_pure_in_memory_operation(self) -> None:
         with mock.patch("builtins.open", side_effect=AssertionError("compact analysis attempted file I/O")):
             result = compact.analyze_capture_compact(self.capture, top_n=3, anomaly_limit=1)
