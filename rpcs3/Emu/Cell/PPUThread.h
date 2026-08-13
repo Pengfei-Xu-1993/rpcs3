@@ -9,6 +9,8 @@
 #include "util/logs.hpp"
 #include "util/v128.hpp"
 
+#include <atomic>
+
 LOG_CHANNEL(ppu_log, "PPU");
 
 enum class ppu_cmd : u32
@@ -373,6 +375,10 @@ public:
 	ppu_thread* next_cpu{}; // LV2 sleep queues' node link
 	ppu_thread* next_ppu{}; // LV2 PPU running queue's node link
 	bool ack_suspend = false;
+
+	// Process-local indirection used by persistent Live Probe PPU JIT objects.
+	// The object stores this stable field offset, never the heap address itself.
+	std::atomic<u64>* ascension_live_probe_gate{};
 
 	be_t<u64>* get_stack_arg(s32 i, u64 align = alignof(u64));
 	void exec_task();

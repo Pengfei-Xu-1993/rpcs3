@@ -3900,11 +3900,15 @@ public:
 			{
 				bool added = false;
 				std::string& llvm_error = g_spu_llvm_compile_context->llvm_error;
+				std::string llvm_cache_path = m_spurt->get_cache_path();
+				llvm_cache_path += ascension::live_probe::bootstrap_enabled()
+					? ascension::live_probe::spu_debug_cache_directory
+					: std::string_view{"llvm/"};
 
 				if (g_cfg.core.spu_debug)
 				{
 					// Testing only
-					added = m_jit.try_add(std::move(_module), m_spurt->get_cache_path() + "llvm/", llvm_error);
+					added = m_jit.try_add(std::move(_module), llvm_cache_path, llvm_error);
 				}
 				else
 				{
@@ -3923,10 +3927,14 @@ public:
 			}
 			else
 			{
+				std::string llvm_cache_path = m_spurt->get_cache_path();
+				llvm_cache_path += ascension::live_probe::bootstrap_enabled()
+					? ascension::live_probe::spu_debug_cache_directory
+					: std::string_view{"llvm/"};
 				if (g_cfg.core.spu_debug)
 				{
 					// Testing only
-					m_jit.add(std::move(_module), m_spurt->get_cache_path() + "llvm/");
+					m_jit.add(std::move(_module), llvm_cache_path);
 				}
 				else
 				{
@@ -3936,10 +3944,14 @@ public:
 				m_jit.fin();
 			}
 #else
+			std::string llvm_cache_path = m_spurt->get_cache_path();
+			llvm_cache_path += ascension::live_probe::bootstrap_enabled()
+				? ascension::live_probe::spu_debug_cache_directory
+				: std::string_view{"llvm/"};
 			if (g_cfg.core.spu_debug)
 			{
 				// Testing only
-				m_jit.add(std::move(_module), m_spurt->get_cache_path() + "llvm/");
+				m_jit.add(std::move(_module), llvm_cache_path);
 			}
 			else
 			{
@@ -10243,19 +10255,15 @@ public:
 		// The Live Probe cache contains one runtime gate at the verified task
 		// call. It records no payload and makes no host call while disarmed.
 		if (!m_interp_magn && ascension::live_probe::bootstrap_enabled() &&
-			ascension::live_probe::authorized() &&
 			m_pos == ascension::spu_task_probe::task_call_pc &&
 			target == ascension::spu_task_probe::task_dma_target_pc)
 		{
 			const auto task_header_lsa = eval(extract(get_reg_fixed<u32[4]>(84), 3));
 			const auto task_context_lsa = eval(extract(get_reg_fixed<u32[4]>(90), 3));
 			const auto dma_descriptor_lsa = eval(extract(get_reg_fixed<u32[4]>(95), 3));
-			auto* gate_pointer = m_ir->CreateIntToPtr(
-				m_ir->getInt64(reinterpret_cast<u64>(ascension::live_probe::ppu_gate_address())),
-				get_type<u64*>());
-			auto* gate = m_ir->CreateLoad(get_type<u64>(), gate_pointer);
-			gate->setAtomic(llvm::AtomicOrdering::Acquire);
-			gate->setAlignment(llvm::Align(8));
+			auto* gate = call(
+				ascension::live_probe::runtime_gate_helper_symbol,
+				&ascension::live_probe::runtime_gate_value);
 			const auto publish = llvm::BasicBlock::Create(m_context, "ascension.live_probe.spu.publish", m_function);
 			const auto next = llvm::BasicBlock::Create(m_context, "ascension.live_probe.spu.next", m_function);
 			m_ir->CreateCondBr(
@@ -10266,7 +10274,8 @@ public:
 
 			m_ir->SetInsertPoint(publish);
 			const auto register_type = llvm::ArrayType::get(get_type<u32>(), 128);
-			const auto registers = m_ir->CreateAlloca(register_type);
+			llvm::IRBuilder<> entry_builder(&m_function->getEntryBlock(), m_function->getEntryBlock().begin());
+			const auto registers = entry_builder.CreateAlloca(register_type);
 			for (u32 reg = 0; reg < 128; ++reg)
 			{
 				const auto address = m_ir->CreateInBoundsGEP(

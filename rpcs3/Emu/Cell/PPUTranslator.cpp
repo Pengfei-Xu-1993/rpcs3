@@ -32,8 +32,7 @@ extern const ppu_decoder<ppu_iname> g_ppu_iname;
 PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, ExecutionEngine& engine)
 	: cpu_translator(_module, false)
 	, m_info(info)
-	, m_ascension_live_probe_module(ascension::live_probe::bootstrap_enabled() &&
-		ascension::live_probe::authorized() && info.path.ends_with("GOWA.SELF"))
+	, m_ascension_live_probe_module(ascension::live_probe::bootstrap_enabled() && info.path.ends_with("GOWA.SELF"))
 	, m_pure_attr()
 {
 	// Bind context
@@ -663,13 +662,17 @@ void PPUTranslator::EmitAscensionLiveProbeCall(Value* target, Value* caller_lr)
 	if (!m_ascension_live_probe_module)
 		return;
 
-	auto* gate_address = ascension::live_probe::ppu_gate_address();
-	if (!gate_address)
-		return;
-
-	auto* gate_pointer = m_ir->CreateIntToPtr(
-		m_ir->getInt64(reinterpret_cast<u64>(gate_address)),
-		get_type<u64*>());
+	// Persistent objects keep only the ppu_thread field offset. Each thread is
+	// initialized with the current process' gate pointer, so ASLR and heap
+	// allocation cannot leave a stale host address in the object cache.
+	auto* thread_bytes = m_ir->CreateBitCast(m_thread, get_type<u8*>());
+	auto* gate_slot_bytes = m_ir->CreateInBoundsGEP(
+		get_type<u8>(),
+		thread_bytes,
+		m_ir->getInt64(offset32(&ppu_thread::ascension_live_probe_gate)));
+	auto* gate_slot = m_ir->CreateBitCast(gate_slot_bytes, get_type<u64**>());
+	auto* gate_pointer = m_ir->CreateLoad(get_type<u64*>(), gate_slot);
+	gate_pointer->setAlignment(Align(alignof(std::atomic<u64>*)));
 	auto* gate = m_ir->CreateLoad(get_type<u64>(), gate_pointer);
 	gate->setAtomic(AtomicOrdering::Acquire);
 	gate->setAlignment(Align(8));

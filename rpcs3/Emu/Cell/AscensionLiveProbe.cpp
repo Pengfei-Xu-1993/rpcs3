@@ -946,6 +946,13 @@ namespace ascension::live_probe
 		return bootstrap_enabled() ? &state().ppu_gate : nullptr;
 	}
 
+	u64 runtime_gate_value()
+	{
+		if (!bootstrap_enabled())
+			return 0;
+		return state().ppu_gate.load(std::memory_order_acquire);
+	}
+
 	void observe_ppu_call(ppu_thread* ppu, u32 pc, u32 target, u64 caller_lr)
 	{
 		if (!ppu || !bootstrap_enabled())

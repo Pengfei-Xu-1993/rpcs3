@@ -859,8 +859,10 @@ void spu_cache::initialize(bool build_existing_cache)
 	}
 
 	// SPU cache file (version + block size type)
-	const std::string filename = "spu-" + fmt::to_lower(g_cfg.core.spu_block_size.to_string()) +
-		(ascension::live_probe::bootstrap_enabled() ? "-v1-tane-live-probe-v1.dat" : "-v1-tane.dat");
+	std::string filename = "spu-" + fmt::to_lower(g_cfg.core.spu_block_size.to_string());
+	filename += ascension::live_probe::bootstrap_enabled()
+		? ascension::live_probe::spu_cache_filename_suffix
+		: "-v1-tane.dat";
 	const std::string loc = ppu_cache + filename;
 	const std::string loc_debug = fs::get_cache_dir() + "DEBUG/" + filename;
 

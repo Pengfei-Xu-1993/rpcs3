@@ -17,6 +17,10 @@ namespace ascension::live_probe
 	constexpr std::string_view supported_title_id = "BCAS25016";
 	constexpr std::string_view supported_app_version = "01.12";
 	constexpr std::string_view supported_executable_hash = "PPU-3a0b43e4a5f4bfea64f53612ee7c5d990f88129c";
+	constexpr char runtime_gate_helper_symbol[] = "__ascension_live_probe_runtime_gate_v2";
+	constexpr std::string_view ppu_cache_directory = "ascension-live-probe-v2/";
+	constexpr std::string_view spu_cache_filename_suffix = "-v1-tane-live-probe-v2.dat";
+	constexpr std::string_view spu_debug_cache_directory = "llvm-live-probe-v2/";
 
 	enum class event_type : u16
 	{
@@ -158,6 +162,7 @@ namespace ascension::live_probe
 	// PPU JIT blocks load this packed gate directly. Bit 63 is ARM, the low
 	// 32 bits contain the currently selected guest call-site PC.
 	std::atomic<u64>* ppu_gate_address();
+	u64 runtime_gate_value();
 	void observe_ppu_call(ppu_thread* ppu, u32 pc, u32 target, u64 caller_lr);
 
 	// The existing verified SPU BRSL site calls this lightweight observer. The
