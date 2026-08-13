@@ -935,6 +935,16 @@ namespace ascension::live_probe
 				range_valid(pointer_space::guest, nullptr, match.guest_ea, size) &&
 				std::memcmp(spu.ls + lsa, vm::base(match.guest_ea), size) == 0;
 		}
+
+		constexpr u32 provenance_mask(
+			const mfc_provenance_match& task_header,
+			const mfc_provenance_match& task_context,
+			const mfc_provenance_match& dma_descriptor)
+		{
+			return (task_header.found ? 1u : 0u) |
+				(task_context.found ? 2u : 0u) |
+				(dma_descriptor.found ? 4u : 0u);
+		}
 	}
 
 	bool bootstrap_enabled()
@@ -1133,9 +1143,24 @@ namespace ascension::live_probe
 			return;
 
 		const u64 provenance_epoch = probe.mfc_provenance_epoch.load(std::memory_order_acquire);
+		const auto task_header_anchor_provenance = resolve_mfc_provenance(*spu, task_header_lsa + 0x04, 4, provenance_epoch);
+		const auto task_context_anchor_provenance = resolve_mfc_provenance(*spu, task_context_lsa, 4, provenance_epoch);
+		const auto dma_descriptor_anchor_provenance = resolve_mfc_provenance(*spu, dma_descriptor_lsa, 4, provenance_epoch);
+		const u32 anchor_provenance_mask = provenance_mask(
+			task_header_anchor_provenance,
+			task_context_anchor_provenance,
+			dma_descriptor_anchor_provenance);
 		auto task_header_provenance = resolve_mfc_provenance(*spu, task_header_lsa, 0x38, provenance_epoch);
 		auto task_context_provenance = resolve_mfc_provenance(*spu, task_context_lsa, 0x0c, provenance_epoch);
 		auto dma_descriptor_provenance = resolve_mfc_provenance(*spu, dma_descriptor_lsa, 0x10, provenance_epoch);
+		const u32 full_span_provenance_mask = provenance_mask(
+			task_header_provenance,
+			task_context_provenance,
+			dma_descriptor_provenance);
+		const u32 readable_provenance_mask =
+			(task_header_provenance.found && range_valid(pointer_space::guest, nullptr, task_header_provenance.guest_ea, 0x38) ? 1u : 0u) |
+			(task_context_provenance.found && range_valid(pointer_space::guest, nullptr, task_context_provenance.guest_ea, 0x0c) ? 2u : 0u) |
+			(dma_descriptor_provenance.found && range_valid(pointer_space::guest, nullptr, dma_descriptor_provenance.guest_ea, 0x10) ? 4u : 0u);
 		if (!provenance_matches_ls(*spu, task_header_provenance, task_header_lsa, 0x38))
 			task_header_provenance = {};
 		if (!provenance_matches_ls(*spu, task_context_provenance, task_context_lsa, 0x0c))
@@ -1174,16 +1199,20 @@ namespace ascension::live_probe
 		event.words[42] = source_1;
 		event.words[43] = output_base;
 		event.words[44] = output_end;
-		event.words[46] =
-			(task_header_provenance.found ? 1u : 0u) |
-			(task_context_provenance.found ? 2u : 0u) |
-			(dma_descriptor_provenance.found ? 4u : 0u);
+		event.words[46] = provenance_mask(task_header_provenance, task_context_provenance, dma_descriptor_provenance);
 		event.words[47] = task_header_provenance.guest_ea;
 		event.words[48] = task_context_provenance.guest_ea;
 		event.words[49] = dma_descriptor_provenance.guest_ea;
 		event.words[50] = task_header_provenance.age;
 		event.words[51] = task_context_provenance.age;
 		event.words[52] = dma_descriptor_provenance.age;
+		// Diagnostic stages only: record seen, real anchor-field hit, complete
+		// linear-span hit, guest-readable span, then validated word 46.
+		event.words[53] = anchor_provenance_mask |
+			(spu->ascension_mfc_get_provenance.order() ? 1u << 31 : 0u);
+		event.words[54] = full_span_provenance_mask | (readable_provenance_mask << 8);
+		event.words[55] = 1;
+		event.header.flags |= event_flag_mfc_diagnostics;
 		if (event.words[46])
 			event.header.flags |= event_flag_mfc_provenance;
 		pointer_context context{};

@@ -738,6 +738,16 @@ def _mfc_provenance_diagnostics(
     """Summarize same-SPU DMA source coverage without exposing guest EAs."""
 
     total = len(capture.spu)
+    diagnostic_events = [event for event in capture.spu if event.mfc_diagnostics_supported]
+    diagnostic_total = len(diagnostic_events)
+    stage_inconsistencies = 0
+    for event in diagnostic_events:
+        if (
+            event.mfc_provenance_mask & ~event.mfc_readable_mask
+            or event.mfc_readable_mask & ~event.mfc_full_span_mask
+            or event.mfc_full_span_mask & ~event.mfc_anchor_mask
+        ):
+            stage_inconsistencies += 1
     fields: list[dict[str, object]] = []
     for name, bit, ea_attribute, age_attribute in MFC_PROVENANCE_FIELDS:
         mapped = [event for event in capture.spu if event.mfc_provenance_mask & bit]
@@ -757,6 +767,18 @@ def _mfc_provenance_diagnostics(
                 "field": name,
                 "mapped": len(mapped),
                 "coverage": (len(mapped) / total) if total else None,
+                "anchor_coverage": (
+                    sum(bool(event.mfc_anchor_mask & bit) for event in diagnostic_events) / diagnostic_total
+                    if diagnostic_total else None
+                ),
+                "full_span_coverage": (
+                    sum(bool(event.mfc_full_span_mask & bit) for event in diagnostic_events) / diagnostic_total
+                    if diagnostic_total else None
+                ),
+                "readable_coverage": (
+                    sum(bool(event.mfc_readable_mask & bit) for event in diagnostic_events) / diagnostic_total
+                    if diagnostic_total else None
+                ),
                 "distinct_eas": len(set(eas)),
                 "distinct_pages": len({ea >> 12 for ea in eas}),
                 "age_p50": _nearest_rank(ages, 0.50),
@@ -769,6 +791,13 @@ def _mfc_provenance_diagnostics(
     return {
         "spu_with_any_mapping": any_mapped,
         "coverage": (any_mapped / total) if total else None,
+        "diagnostic_event_count": diagnostic_total,
+        "diagnostic_coverage": (diagnostic_total / total) if total else None,
+        "record_seen_coverage": (
+            sum(event.mfc_record_seen for event in diagnostic_events) / diagnostic_total
+            if diagnostic_total else None
+        ),
+        "stage_inconsistencies": stage_inconsistencies,
         "fields": fields,
     }
 
@@ -876,7 +905,12 @@ def format_model_summary(result: dict[str, object], max_lines: int = 120) -> str
             f"{fmt_value(ppu_join['preceding_ppu_count_p95'])}/"
             f"{fmt_value(ppu_join['preceding_ppu_count_max'])}"
         ),
-        f"MFC GET provenance: any-coverage={fmt_percent(mfc_provenance['coverage'])}",
+        (
+            f"MFC GET provenance: any-coverage={fmt_percent(mfc_provenance['coverage'])} "
+            f"diagnostics={fmt_percent(mfc_provenance['diagnostic_coverage'])} "
+            f"record-seen={fmt_percent(mfc_provenance['record_seen_coverage'])} "
+            f"stage-inconsistencies={mfc_provenance['stage_inconsistencies']}"
+        ),
         f"quality: dropped={counts['dropped_count']} truncated={counts['truncated']}",
         f"candidates: generated={filters['generated']} accepted={filters['accepted']} rejected={filters['rejected']}",
         "Top candidates (aggregate metrics only):",
@@ -892,6 +926,8 @@ def format_model_summary(result: dict[str, object], max_lines: int = 120) -> str
         lines.insert(
             -3,
             f"MFC {field['field']}: coverage={fmt_percent(field['coverage'])} "
+            f"anchor/full/readable={fmt_percent(field['anchor_coverage'])}/"
+            f"{fmt_percent(field['full_span_coverage'])}/{fmt_percent(field['readable_coverage'])} "
             f"distinct-ea/page={field['distinct_eas']}/{field['distinct_pages']} "
             f"age p50/p95/max={fmt_value(field['age_p50'])}/"
             f"{fmt_value(field['age_p95'])}/{fmt_value(field['age_max'])}; best={best_text}",

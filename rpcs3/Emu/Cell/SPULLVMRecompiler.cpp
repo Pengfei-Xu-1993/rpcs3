@@ -15,6 +15,7 @@
 #include "SPUAnalyser.h"
 #include "SPUInterpreter.h"
 #include "AscensionLiveProbe.h"
+#include "AscensionMfcRouting.h"
 #include "AscensionSpuTaskProbe.h"
 #include <algorithm>
 #include <thread>
@@ -5152,6 +5153,16 @@ public:
 				}
 
 				bool must_use_cpp_functions = !!g_cfg.core.spu_accurate_dma;
+				if (ascension::live_probe::force_cpp_mfc_get(
+						static_cast<u8>(ci->getZExtValue()),
+						ascension::live_probe::bootstrap_enabled()))
+				{
+					// Constant GET/GETB/GETF normally become inline LLVM copies and
+					// bypass do_dma_transfer(). The isolated Live Probe process must
+					// route them through the recorder-capable C++ path. Do not use the
+					// runtime armed state here: this choice is cached with the JIT block.
+					must_use_cpp_functions = true;
+				}
 
 				if (u64 cmdh = ci->getZExtValue() & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_RESULT_MASK); g_cfg.core.rsx_fifo_accuracy || g_cfg.video.strict_rendering_mode || /*!g_use_rtm*/ true)
 				{

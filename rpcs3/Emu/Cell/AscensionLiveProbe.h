@@ -19,8 +19,8 @@ namespace ascension::live_probe
 	constexpr std::string_view supported_executable_hash = "PPU-3a0b43e4a5f4bfea64f53612ee7c5d990f88129c";
 	constexpr char runtime_gate_helper_symbol[] = "__ascension_live_probe_runtime_gate_v2";
 	constexpr std::string_view ppu_cache_directory = "ascension-live-probe-v2/";
-	constexpr std::string_view spu_cache_filename_suffix = "-v1-tane-live-probe-v2.dat";
-	constexpr std::string_view spu_debug_cache_directory = "llvm-live-probe-v2/";
+	constexpr std::string_view spu_cache_filename_suffix = "-v1-tane-live-probe-v3.dat";
+	constexpr std::string_view spu_debug_cache_directory = "llvm-live-probe-v3/";
 
 	enum class event_type : u16
 	{
@@ -41,6 +41,7 @@ namespace ascension::live_probe
 		event_flag_pointer_data = 1u << 3,
 		event_flag_snapshot = 1u << 4,
 		event_flag_mfc_provenance = 1u << 5,
+		event_flag_mfc_diagnostics = 1u << 6,
 	};
 
 	struct record_header_v1

@@ -37,6 +37,7 @@ EVENT_SPU = 2
 EVENT_RSX = 3
 EVENT_FLAG_AUTHORIZED = 1 << 0
 EVENT_FLAG_MFC_PROVENANCE = 1 << 5
+EVENT_FLAG_MFC_DIAGNOSTICS = 1 << 6
 SNAPSHOT_SPU_LS = 0x100
 SNAPSHOT_PPU_STACK = 0x101
 DEFAULT_MAX_EVENTS = 250_000
@@ -122,6 +123,11 @@ class SPUEvent:
     task_header_mfc_age: int = 0
     task_context_mfc_age: int = 0
     dma_descriptor_mfc_age: int = 0
+    mfc_diagnostics_supported: bool = False
+    mfc_record_seen: bool = False
+    mfc_anchor_mask: int = 0
+    mfc_full_span_mask: int = 0
+    mfc_readable_mask: int = 0
     occurrence: int = 0
     output_frame_relative: int = 0
     nearest_ppu: PPUEvent | None = None
@@ -253,7 +259,9 @@ def read_capture(path: os.PathLike[str] | str) -> Capture:
                     words[33], words[34], words[35], words[36], words[37], words[38],
                     words[39], words[40], words[41], words[42], words[43], words[44],
                     _decode_pointers(blob, words[45]), words[46], words[47], words[48],
-                    words[49], words[50], words[51], words[52]))
+                    words[49], words[50], words[51], words[52],
+                    bool(flags & EVENT_FLAG_MFC_DIAGNOSTICS), bool(words[53] & (1 << 31)),
+                    words[53] & 7, words[54] & 7, (words[54] >> 8) & 7))
             elif event_type == EVENT_RSX:
                 rsx_events.append(RSXEvent(
                     sequence, time_us, frame, producer, words[0], words[1], words[2],
@@ -1104,10 +1112,14 @@ def write_synthetic_capture(path: pathlib.Path) -> None:
             words[45] = 1
             token = 0x500000 + instance * 0x1000
             words[46:53] = [7, token, token + 0x100, token + 0x200, 2, 1, 0]
+            words[53] = (1 << 31) | 7
+            words[54] = 7 | (7 << 8)
+            words[55] = 1
             events.append(_pack_event(EVENT_SPU, sequence, time_us, frame,
                                       values=values, words=words,
                                       pointers=[_pack_pointer(1, 0x100000, token, token ^ 0xABCDEF)],
-                                      flags=EVENT_FLAG_AUTHORIZED | EVENT_FLAG_MFC_PROVENANCE))
+                                      flags=EVENT_FLAG_AUTHORIZED | EVENT_FLAG_MFC_PROVENANCE |
+                                      EVENT_FLAG_MFC_DIAGNOSTICS))
             sequence += 1
             rsx_words = [0] * 64
             rsx_words[1:4] = [11, 22, 512]

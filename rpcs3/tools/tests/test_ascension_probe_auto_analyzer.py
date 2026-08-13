@@ -462,11 +462,54 @@ class CompactOutputContractTests(unittest.TestCase):
             probe.EVENT_FLAG_AUTHORIZED | probe.EVENT_FLAG_MFC_PROVENANCE,
         )
         self.assertEqual(first.mfc_provenance_mask, 7)
-        self.assertTrue(first.task_header_guest_ea)
+        self.assertEqual(
+            (
+                first.task_header_guest_ea,
+                first.task_context_guest_ea,
+                first.dma_descriptor_guest_ea,
+            ),
+            (SECRET_TOKEN_BASE, SECRET_TOKEN_BASE + 0x100, SECRET_TOKEN_BASE + 0x200),
+        )
         self.assertEqual(
             (first.task_header_mfc_age, first.task_context_mfc_age, first.dma_descriptor_mfc_age),
             (2, 1, 0),
         )
+        self.assertTrue(first.mfc_diagnostics_supported)
+        self.assertTrue(first.mfc_record_seen)
+        self.assertEqual(first.mfc_anchor_mask, 7)
+        self.assertEqual(first.mfc_full_span_mask, 7)
+        self.assertEqual(first.mfc_readable_mask, 7)
+
+    def test_mfc_diagnostic_stages_are_aggregate_and_independent_of_bit5(self) -> None:
+        for index, event in enumerate(self.capture.spu):
+            event.mfc_diagnostics_supported = True
+            event.mfc_record_seen = index != 0
+            event.mfc_anchor_mask = 7
+            event.mfc_full_span_mask = 3 if index < 6 else 0
+            event.mfc_readable_mask = 1 if index < 4 else 0
+            event.mfc_provenance_mask = 1 if index < 2 else 0
+
+        result = compact.analyze_capture_compact(self.capture, top_n=20, anomaly_limit=2)
+        diagnostics = result["mfc_provenance"]
+        self.assertEqual(diagnostics["diagnostic_coverage"], 1.0)
+        self.assertEqual(diagnostics["record_seen_coverage"], 15 / 16)
+        self.assertEqual(diagnostics["stage_inconsistencies"], 0)
+        header, context, descriptor = diagnostics["fields"]
+        self.assertEqual(
+            (header["anchor_coverage"], header["full_span_coverage"], header["readable_coverage"], header["coverage"]),
+            (1.0, 6 / 16, 4 / 16, 2 / 16),
+        )
+        self.assertEqual(
+            (context["anchor_coverage"], context["full_span_coverage"], context["readable_coverage"], context["coverage"]),
+            (1.0, 6 / 16, 0.0, 0.0),
+        )
+        self.assertEqual(
+            (descriptor["anchor_coverage"], descriptor["full_span_coverage"], descriptor["readable_coverage"], descriptor["coverage"]),
+            (1.0, 0.0, 0.0, 0.0),
+        )
+        summary = compact.format_model_summary(result, max_lines=24)
+        self.assertIn("record-seen=93.8%", summary)
+        self.assertIn("anchor/full/readable=100.0%/37.5%/25.0%", summary)
 
     def test_mfc_provenance_mask_preserves_guest_ea_zero(self) -> None:
         event = self.capture.spu[0]

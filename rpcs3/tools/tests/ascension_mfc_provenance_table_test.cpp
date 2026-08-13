@@ -1,4 +1,5 @@
 #include "Emu/Cell/AscensionMfcProvenance.h"
+#include "Emu/Cell/AscensionMfcRouting.h"
 #include "Emu/Cell/AscensionLiveProbeBudget.h"
 
 #include <atomic>
@@ -125,6 +126,18 @@ namespace
 		CHECK(ascension::live_probe::try_reserve_event(accepted, 0));
 		CHECK(accepted.load() == 1);
 	}
+
+	void test_probe_routes_all_ordinary_get_modifiers_through_cpp()
+	{
+		using ascension::live_probe::force_cpp_mfc_get;
+		CHECK(force_cpp_mfc_get(MFC_GET_CMD, true));
+		CHECK(force_cpp_mfc_get(MFC_GETB_CMD, true));
+		CHECK(force_cpp_mfc_get(MFC_GETF_CMD, true));
+		CHECK(!force_cpp_mfc_get(MFC_GET_CMD, false));
+		CHECK(!force_cpp_mfc_get(MFC_PUT_CMD, true));
+		CHECK(!force_cpp_mfc_get(MFC_GETL_CMD, true));
+		CHECK(!force_cpp_mfc_get(MFC_GETS_CMD, true));
+	}
 } // namespace
 
 int main()
@@ -133,6 +146,7 @@ int main()
 	test_partial_and_cross_granule_updates();
 	test_boundaries_epoch_and_zero_ea();
 	test_event_budget_is_strict_under_contention();
+	test_probe_routes_all_ordinary_get_modifiers_through_cpp();
 	if (failures)
 		return 1;
 	std::cout << "ascension MFC provenance table tests passed\n";
