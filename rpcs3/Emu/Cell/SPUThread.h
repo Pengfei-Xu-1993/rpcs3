@@ -971,6 +971,23 @@ public:
 			return static_cast<std::conditional_t<std::is_void_v<Func>, Func, decltype(_this->group)>>(_this->group)->prio.atomic_op(std::move(func));
 		}
 	} prio{ this };
+
+	// Append-only diagnostic state for the authorized Ascension Live Probe.
+	// Keeping this at the end preserves every existing spu_thread member offset,
+	// including offsets embedded in persistent SPU JIT objects.
+	struct ascension_mfc_get_provenance_entry
+	{
+		u32 lsa = 0;
+		u32 eal = 0;
+		u32 size = 0;
+		u32 epoch = 0;
+		u32 order = 0;
+	};
+
+	static constexpr u32 ascension_mfc_get_provenance_capacity = 128;
+	std::array<ascension_mfc_get_provenance_entry, ascension_mfc_get_provenance_capacity> ascension_mfc_get_provenance{};
+	u32 ascension_mfc_get_provenance_next = 0;
+	u32 ascension_mfc_get_provenance_order = 0;
 };
 
 class spu_function_logger

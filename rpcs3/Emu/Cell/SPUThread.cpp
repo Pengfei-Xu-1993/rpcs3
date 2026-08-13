@@ -19,6 +19,7 @@
 
 #include "Emu/Cell/SPUDisAsm.h"
 #include "Emu/Cell/SPUAnalyser.h"
+#include "Emu/Cell/AscensionLiveProbe.h"
 #include "Emu/Cell/AscensionSpuTaskProbe.h"
 #include "Emu/Cell/SPUThread.h"
 #include "Emu/Cell/SPURecompiler.h"
@@ -2047,6 +2048,11 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 	u32 eal = args.eal;
 	u32 lsa = args.lsa & 0x3ffff;
 
+	if (is_get)
+	{
+		ascension::live_probe::record_spu_mfc_get(_this, lsa, eal, args.size);
+	}
+
 	// Keep src point to const
 	u8* dst = nullptr;
 	const u8* src = nullptr;
@@ -2860,6 +2866,14 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 	u8 optimization_compatible = transfer.cmd & (MFC_GET_CMD | MFC_PUT_CMD);
 
 	if (spu_log.trace || g_cfg.core.spu_accurate_dma || g_cfg.core.mfc_debug)
+	{
+		optimization_compatible = 0;
+	}
+
+	// Both the six-item and single-item GET-list fast paths bypass
+	// do_dma_transfer(). Route an authorized, armed probe through the shared
+	// runtime transfer path so dynamic list arguments receive provenance too.
+	if (ascension::live_probe::mfc_provenance_enabled())
 	{
 		optimization_compatible = 0;
 	}

@@ -34,6 +34,11 @@ MAX_PPU_CALLSITE_AGGREGATES = 8
 PPU_JOIN_WINDOW_US = 50_000
 PPU_POINTER_CANDIDATE = re.compile(r"^nearest_ppu\.pointer\[(\d+)]\.")
 PPU_REGISTER_CANDIDATE = re.compile(r"^nearest_ppu\.r(\d+)(?:$|\.)")
+MFC_PROVENANCE_FIELDS = (
+    ("task_header", 1, "task_header_guest_ea", "task_header_mfc_age"),
+    ("task_context", 2, "task_context_guest_ea", "task_context_mfc_age"),
+    ("dma_descriptor", 4, "dma_descriptor_guest_ea", "dma_descriptor_mfc_age"),
+)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -95,6 +100,21 @@ def _candidate_specs(capture: probe.Capture) -> list[CandidateSpec]:
     add_address("source1", lambda e: e.source1)
     add_address("auxiliary", lambda e: e.auxiliary)
     add_address("output", lambda e: e.output_start, "output_address")
+    add_address(
+        "mfc.task_header",
+        lambda e: e.task_header_guest_ea if e.mfc_provenance_mask & 1 else 0,
+        "mfc_provenance",
+    )
+    add_address(
+        "mfc.task_context",
+        lambda e: e.task_context_guest_ea if e.mfc_provenance_mask & 2 else 0,
+        "mfc_provenance",
+    )
+    add_address(
+        "mfc.dma_descriptor",
+        lambda e: e.dma_descriptor_guest_ea if e.mfc_provenance_mask & 4 else 0,
+        "mfc_provenance",
+    )
     add("output.frame_relative", "output_derived", lambda e: e.output_frame_relative if e.output_start else None)
     add("output.size", "pipeline_metadata", lambda e: e.output_end - e.output_start if e.output_end > e.output_start else None)
     add("task.sequence", "sequence_metadata", lambda e: e.task_sequence)
@@ -687,6 +707,47 @@ def _ppu_join_diagnostics(
     }
 
 
+def _mfc_provenance_diagnostics(
+    capture: probe.Capture, ranking: list[dict[str, object]]
+) -> dict[str, object]:
+    """Summarize same-SPU DMA source coverage without exposing guest EAs."""
+
+    total = len(capture.spu)
+    fields: list[dict[str, object]] = []
+    for name, bit, ea_attribute, age_attribute in MFC_PROVENANCE_FIELDS:
+        mapped = [event for event in capture.spu if event.mfc_provenance_mask & bit]
+        eas = [int(getattr(event, ea_attribute)) for event in mapped]
+        ages = [int(getattr(event, age_attribute)) for event in mapped]
+        prefix = f"mfc.{name}."
+        best_candidate = next(
+            (
+                item
+                for item in ranking
+                if str(item["candidate"]).startswith(prefix)
+            ),
+            None,
+        )
+        fields.append(
+            {
+                "field": name,
+                "mapped": len(mapped),
+                "coverage": (len(mapped) / total) if total else None,
+                "distinct_eas": len(set(eas)),
+                "distinct_pages": len({ea >> 12 for ea in eas}),
+                "age_p50": _nearest_rank(ages, 0.50),
+                "age_p95": _nearest_rank(ages, 0.95),
+                "age_max": max(ages) if ages else None,
+                "best_candidate": best_candidate,
+            }
+        )
+    any_mapped = sum(bool(event.mfc_provenance_mask & 7) for event in capture.spu)
+    return {
+        "spu_with_any_mapping": any_mapped,
+        "coverage": (any_mapped / total) if total else None,
+        "fields": fields,
+    }
+
+
 def _compact_from_ranking(
     capture: probe.Capture,
     ranking: list[dict[str, object]],
@@ -717,6 +778,7 @@ def _compact_from_ranking(
             )[:MAX_PPU_CALLSITE_AGGREGATES]
         ],
         "ppu_join": _ppu_join_diagnostics(capture, ranking),
+        "mfc_provenance": _mfc_provenance_diagnostics(capture, ranking),
         "filters": {
             "generated": len(ranking),
             "accepted": accepted,
@@ -738,6 +800,7 @@ def _compact_from_ranking(
             "Draw-family grouping is independent of source0 and of the candidate being scored.",
             "arena_token_survival is only an address-rotation proxy, not proof of persistent game-object identity.",
             "arena_rotation_stability remains null until an independent object anchor is captured.",
+            "MFC provenance is a same-SPU DMA source mapping, not proof of a PPU owner or game object.",
             "Accepted candidates are evidence for validation, not automatic approval for DLSS motion vectors.",
         ],
     }
@@ -759,6 +822,7 @@ def format_model_summary(result: dict[str, object], max_lines: int = 120) -> str
     counts = result["counts"]
     filters = result["filters"]
     ppu_join = result["ppu_join"]
+    mfc_provenance = result["mfc_provenance"]
     target = result["target"]
     fmt_percent = lambda value: "n/e" if value is None else f"{value:.1%}"
     fmt_value = lambda value: "n/e" if value is None else str(value)
@@ -787,10 +851,26 @@ def format_model_summary(result: dict[str, object], max_lines: int = 120) -> str
             f"{fmt_value(ppu_join['preceding_ppu_count_p95'])}/"
             f"{fmt_value(ppu_join['preceding_ppu_count_max'])}"
         ),
+        f"MFC GET provenance: any-coverage={fmt_percent(mfc_provenance['coverage'])}",
         f"quality: dropped={counts['dropped_count']} truncated={counts['truncated']}",
         f"candidates: generated={filters['generated']} accepted={filters['accepted']} rejected={filters['rejected']}",
         "Top candidates (aggregate metrics only):",
     ]
+    for field in mfc_provenance["fields"]:
+        best = field["best_candidate"]
+        best_text = "none"
+        if best is not None:
+            best_text = (
+                f"{best['candidate']} [{best['decision']}] "
+                f"reasons={','.join(best['reject_reasons']) or 'none'}"
+            )
+        lines.insert(
+            -3,
+            f"MFC {field['field']}: coverage={fmt_percent(field['coverage'])} "
+            f"distinct-ea/page={field['distinct_eas']}/{field['distinct_pages']} "
+            f"age p50/p95/max={fmt_value(field['age_p50'])}/"
+            f"{fmt_value(field['age_p95'])}/{fmt_value(field['age_max'])}; best={best_text}",
+        )
     best_ppu = ppu_join["best_candidate"]
     if best_ppu is not None and len(lines) < max_lines:
         lines.insert(
@@ -1057,6 +1137,7 @@ def write_compact_outputs(
             "counts": result["counts"],
             "ppu_callsites": result["ppu_callsites"],
             "ppu_join": result["ppu_join"],
+            "mfc_provenance": result["mfc_provenance"],
             "filters": result["filters"],
             "top_candidates": result["top_candidates"],
         },
@@ -1082,7 +1163,7 @@ def _self_test() -> int:
         capture_path = directory / "synthetic.bin"
         probe.write_synthetic_capture(capture_path)
         capture = probe.read_capture(capture_path)
-        result = analyze_capture_compact(capture, top_n=10, anomaly_limit=2)
+        result = analyze_capture_compact(capture, top_n=100, anomaly_limit=2)
         by_name = {item["candidate"]: item for item in result["top_candidates"]}
         assert by_name["pointer[1].address"]["decision"] == "accept"
         assert len(format_model_summary(result, 24).splitlines()) <= 24

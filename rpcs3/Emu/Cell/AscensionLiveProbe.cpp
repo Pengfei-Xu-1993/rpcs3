@@ -135,6 +135,7 @@ namespace ascension::live_probe
 			std::atomic<bool> armed{false};
 			std::atomic<bool> capturing{false};
 			std::atomic<bool> stopping{false};
+			std::atomic<u32> mfc_provenance_epoch{1};
 			std::atomic<u64> ppu_gate{0};
 			std::atomic<u64> current_frame{0};
 			std::atomic<u32> current_rsx_draw_sequence{0};
@@ -482,6 +483,7 @@ namespace ascension::live_probe
 				{
 					if (!capture_file)
 						return "{\"ok\":false,\"error\":\"START_CAPTURE first\"}";
+					mfc_provenance_epoch.fetch_add(1, std::memory_order_acq_rel);
 					armed.store(true, std::memory_order_release);
 					update_ppu_gate();
 					return stats();
@@ -905,6 +907,36 @@ namespace ascension::live_probe
 			for (u32 page = first; page <= last && page < guest_page_count; ++page)
 				probe.output_pages[page].store(id, std::memory_order_release);
 		}
+
+		struct mfc_provenance_match
+		{
+			u32 guest_ea = 0;
+			u32 age = 0;
+			bool found = false;
+		};
+
+		mfc_provenance_match resolve_mfc_provenance(const spu_thread& spu, u32 target_lsa, u32 epoch)
+		{
+			constexpr u32 capacity = spu_thread::ascension_mfc_get_provenance_capacity;
+			static_assert((capacity & (capacity - 1)) == 0);
+			if (target_lsa >= SPU_LS_SIZE)
+				return {};
+
+			const u32 next = spu.ascension_mfc_get_provenance_next;
+			const u32 count = std::min(next, capacity);
+			for (u32 age = 0; age < count; ++age)
+			{
+				const auto& entry = spu.ascension_mfc_get_provenance[(next - 1 - age) & (capacity - 1)];
+				if (entry.epoch != epoch || target_lsa < entry.lsa)
+					continue;
+				const u32 offset = target_lsa - entry.lsa;
+				const u32 guest_ea = entry.eal + offset;
+				if (offset >= entry.size || guest_ea < entry.eal)
+					continue;
+				return {guest_ea, spu.ascension_mfc_get_provenance_order - entry.order, true};
+			}
+			return {};
+		}
 	}
 
 	bool bootstrap_enabled()
@@ -939,6 +971,34 @@ namespace ascension::live_probe
 	bool authorized()
 	{
 		return bootstrap_enabled() && state().executable_authorized.load(std::memory_order_acquire);
+	}
+
+	bool mfc_provenance_enabled()
+	{
+		if (!bootstrap_enabled())
+			return false;
+		probe_state& probe = state();
+		return probe.executable_authorized.load(std::memory_order_acquire) &&
+			probe.capturing.load(std::memory_order_acquire) &&
+			probe.armed.load(std::memory_order_acquire);
+	}
+
+	void record_spu_mfc_get(spu_thread* spu, u32 lsa, u32 eal, u32 size)
+	{
+		if (!spu || !size || lsa >= SPU_LS_SIZE || size > SPU_LS_SIZE - lsa ||
+			eal >= RAW_SPU_BASE_ADDR || size > RAW_SPU_BASE_ADDR - eal ||
+			!mfc_provenance_enabled())
+		{
+			return;
+		}
+
+		probe_state& probe = state();
+		constexpr u32 capacity = spu_thread::ascension_mfc_get_provenance_capacity;
+		const u32 next = spu->ascension_mfc_get_provenance_next;
+		auto& entry = spu->ascension_mfc_get_provenance[next & (capacity - 1)];
+		const u32 order = ++spu->ascension_mfc_get_provenance_order;
+		entry = {lsa, eal, size, probe.mfc_provenance_epoch.load(std::memory_order_acquire), order};
+		spu->ascension_mfc_get_provenance_next = next + 1;
 	}
 
 	std::atomic<u64>* ppu_gate_address()
@@ -1075,6 +1135,11 @@ namespace ascension::live_probe
 		if (!event_allowed(probe))
 			return;
 
+		const u32 provenance_epoch = probe.mfc_provenance_epoch.load(std::memory_order_acquire);
+		const auto task_header_provenance = resolve_mfc_provenance(*spu, task_header_lsa, provenance_epoch);
+		const auto task_context_provenance = resolve_mfc_provenance(*spu, task_context_lsa, provenance_epoch);
+		const auto dma_descriptor_provenance = resolve_mfc_provenance(*spu, dma_descriptor_lsa, provenance_epoch);
+
 		event_record_v1 event{};
 		event.header.type = static_cast<u16>(event_type::spu_task);
 		event.header.flags = event_flag_authorized;
@@ -1106,6 +1171,18 @@ namespace ascension::live_probe
 		event.words[42] = source_1;
 		event.words[43] = output_base;
 		event.words[44] = output_end;
+		event.words[46] =
+			(task_header_provenance.found ? 1u : 0u) |
+			(task_context_provenance.found ? 2u : 0u) |
+			(dma_descriptor_provenance.found ? 4u : 0u);
+		event.words[47] = task_header_provenance.guest_ea;
+		event.words[48] = task_context_provenance.guest_ea;
+		event.words[49] = dma_descriptor_provenance.guest_ea;
+		event.words[50] = task_header_provenance.age;
+		event.words[51] = task_context_provenance.age;
+		event.words[52] = dma_descriptor_provenance.age;
+		if (event.words[46])
+			event.header.flags |= event_flag_mfc_provenance;
 		pointer_context context{};
 		context.spu = spu;
 		context.spu_lane3 = lane3_registers;

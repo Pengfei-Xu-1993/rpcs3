@@ -410,12 +410,53 @@ class CompactOutputContractTests(unittest.TestCase):
             self.capture, top_n=1000, anomaly_limit=2
         )
         names = {item["candidate"] for item in result["top_candidates"]}
-        self.assertFalse(
-            any(
-                "descriptor" in name or "task_header_word_04" in name
-                for name in names
-            ),
-            names,
+        withdrawn = {
+            name
+            for name in names
+            if "task_header_word_04" in name or name.startswith("task.descriptor")
+        }
+        self.assertFalse(withdrawn, withdrawn)
+
+    def test_mfc_provenance_is_aggregate_and_candidate_scored(self) -> None:
+        for event in self.capture.spu:
+            token = SECRET_TOKEN_BASE + event.thread * 0x1000
+            event.mfc_provenance_mask = 7
+            event.task_header_guest_ea = token
+            event.task_context_guest_ea = token + 0x100
+            event.dma_descriptor_guest_ea = token + 0x200
+            event.task_header_mfc_age = 2
+            event.task_context_mfc_age = 1
+            event.dma_descriptor_mfc_age = 0
+
+        result = compact.analyze_capture_compact(
+            self.capture, top_n=1000, anomaly_limit=2
+        )
+        diagnostics = result["mfc_provenance"]
+        self.assertEqual(diagnostics["coverage"], 1.0)
+        self.assertEqual(
+            [field["coverage"] for field in diagnostics["fields"]],
+            [1.0, 1.0, 1.0],
+        )
+        by_name = {item["candidate"]: item for item in result["top_candidates"]}
+        self.assertEqual(by_name["mfc.task_header.absolute"]["decision"], "accept")
+
+        summary = compact.format_model_summary(result, max_lines=24)
+        self.assertIn("MFC GET provenance: any-coverage=100.0%", summary)
+        self.assertIn("MFC task_header: coverage=100.0%", summary)
+        self.assertNotIn(str(SECRET_TOKEN_BASE), summary)
+        self.assertNotIn(f"0x{SECRET_TOKEN_BASE:x}", summary.lower())
+
+    def test_synthetic_abi_decodes_reserved_mfc_provenance_words(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            capture_path = pathlib.Path(directory) / "synthetic.bin"
+            probe.write_synthetic_capture(capture_path)
+            capture = probe.read_capture(capture_path)
+        first = capture.spu[0]
+        self.assertEqual(first.mfc_provenance_mask, 7)
+        self.assertTrue(first.task_header_guest_ea)
+        self.assertEqual(
+            (first.task_header_mfc_age, first.task_context_mfc_age, first.dma_descriptor_mfc_age),
+            (2, 1, 0),
         )
 
     def test_anomalies_are_capped_per_kind(self) -> None:

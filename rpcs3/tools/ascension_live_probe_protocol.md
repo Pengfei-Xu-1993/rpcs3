@@ -106,6 +106,19 @@ eight 56-byte pointer-follow results.
   not a verified guest descriptor address and must not be dereferenced or
   used as an identity candidate.
 - `words[45]`: pointer-result count.
+- `words[46]`: runtime MFC GET provenance mask (`bit0=task header`,
+  `bit1=task context`, `bit2=DMA descriptor`).
+- `words[47..49]`: guest EAs corresponding to the three LS addresses when the
+  most recent covering GET is present in the same SPU's fixed provenance ring.
+- `words[50..52]`: number of recorded GET transfers since each matched source
+  transfer. These fields are aggregate diagnostics, not a PPU owner token.
+- Event flag bit 5 is set when at least one provenance-mask bit is present.
+
+While the exact executable is authorized and capture is armed, GET-list
+inlining is disabled so dynamic direct transfers, six-item list batches, and
+single-item list transfers all pass through the same runtime recorder. The
+ring is reset logically by an epoch on every `ARM`; old ABI-v1 captures decode
+these reserved words as zero.
 
 ### RSX draw event (`type=3`)
 

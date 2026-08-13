@@ -92,6 +92,13 @@ class SPUEvent:
     output_start: int
     output_end: int
     pointers: tuple[PointerResult, ...]
+    mfc_provenance_mask: int = 0
+    task_header_guest_ea: int = 0
+    task_context_guest_ea: int = 0
+    dma_descriptor_guest_ea: int = 0
+    task_header_mfc_age: int = 0
+    task_context_mfc_age: int = 0
+    dma_descriptor_mfc_age: int = 0
     occurrence: int = 0
     output_frame_relative: int = 0
     nearest_ppu: PPUEvent | None = None
@@ -222,7 +229,8 @@ def read_capture(path: os.PathLike[str] | str) -> Capture:
                     sequence, time_us, frame, thread, pc, target, registers,
                     words[33], words[34], words[35], words[36], words[37], words[38],
                     words[39], words[40], words[41], words[42], words[43], words[44],
-                    _decode_pointers(blob, words[45])))
+                    _decode_pointers(blob, words[45]), words[46], words[47], words[48],
+                    words[49], words[50], words[51], words[52]))
             elif event_type == EVENT_RSX:
                 rsx_events.append(RSXEvent(
                     sequence, time_us, frame, producer, words[0], words[1], words[2],
@@ -713,6 +721,7 @@ def write_synthetic_capture(path: pathlib.Path) -> None:
                             0x800000 + frame * 0x20000 + instance * 0x4000 + 0x2000]
             words[45] = 1
             token = 0x500000 + instance * 0x1000
+            words[46:53] = [7, token, token + 0x100, token + 0x200, 2, 1, 0]
             events.append(_pack_event(EVENT_SPU, sequence, time_us, frame,
                                       values=values, words=words,
                                       pointers=[_pack_pointer(1, 0x100000, token, token ^ 0xABCDEF)]))

@@ -40,6 +40,7 @@ namespace ascension::live_probe
 		event_flag_stack_valid = 1u << 2,
 		event_flag_pointer_data = 1u << 3,
 		event_flag_snapshot = 1u << 4,
+		event_flag_mfc_provenance = 1u << 5,
 	};
 
 	struct record_header_v1
@@ -161,6 +162,12 @@ namespace ascension::live_probe
 	// BCAS25016 v1.12 and the exact verified GOWA.SELF hash.
 	void authorize_executable(std::string_view executable_hash);
 	bool authorized();
+
+	// Runtime MFC GET provenance is enabled only while the exact executable is
+	// authorized and a capture is armed. The record path is fixed-size and is
+	// called with the dynamic command arguments at actual DMA execution time.
+	bool mfc_provenance_enabled();
+	void record_spu_mfc_get(spu_thread* spu, u32 lsa, u32 eal, u32 size);
 
 	// PPU JIT blocks load this packed gate directly. Bit 63 is ARM, the low
 	// 32 bits contain the currently selected guest call-site PC.
