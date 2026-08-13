@@ -613,8 +613,9 @@ if(NOT ANDROID AND NOT APPLE)
 endif()
 
 if(TARGET 3rdparty_vulkan)
-    target_sources(rpcs3_emu PRIVATE
-        RSX/VK/upscalers/fsr1/fsr_pass.cpp
+		target_sources(rpcs3_emu PRIVATE
+			RSX/VK/upscalers/fsr1/fsr_pass.cpp
+			RSX/VK/upscalers/temporal_capture.cpp
         RSX/VK/vkutils/barriers.cpp
         RSX/VK/vkutils/buffer_object.cpp
         RSX/VK/vkutils/chip_class.cpp
@@ -663,6 +664,12 @@ if(TARGET 3rdparty_vulkan)
         RSX/VK/VKTextureCache.cpp
         RSX/VK/VulkanAPI.cpp
     )
+    if(TARGET 3rdparty::nvidia_dlss)
+        target_sources(rpcs3_emu PRIVATE
+            RSX/VK/upscalers/dlss_pass.cpp
+        )
+        target_link_libraries(rpcs3_emu PRIVATE 3rdparty::nvidia_dlss)
+    endif()
     if(APPLE)
         target_sources(rpcs3_emu PRIVATE
             RSX/VK/vkutils/metal_layer.mm

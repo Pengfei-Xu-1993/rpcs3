@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "VKGSRender.h"
+#include "../Core/CharacterVertexProbe.h"
 #include "vkutils/buffer_object.h"
 #include "vkutils/memory.h"
 #include "Emu/RSX/Overlays/overlay_manager.h"
@@ -7,6 +8,9 @@
 #include "Emu/Cell/Modules/cellVideoOut.h"
 
 #include "upscalers/bilinear_pass.hpp"
+#ifdef RPCS3_HAS_NVIDIA_DLSS
+#include "upscalers/dlss_pass.h"
+#endif
 #include "upscalers/fsr_pass.h"
 #include "upscalers/nearest_pass.hpp"
 #include "util/asm.hpp"
@@ -78,6 +82,7 @@ bool VKGSRender::reinitialize_swapchain()
 	ensure(m_queued_frames.empty());
 
 	// Discard the current upscaling pipeline if any
+	m_temporal_frame_tracker.request_reset(vk::temporal_history_reset_reason::swapchain_recreated);
 	m_upscaler.reset();
 
 	// Drain all the queues
@@ -213,15 +218,24 @@ void VKGSRender::queue_swap_request()
 	if (m_swapchain->is_headless())
 	{
 		m_swapchain->end_frame(*m_current_command_buffer, m_current_frame->present_image);
-		close_and_submit_command_buffer();
+		close_and_submit_command_buffer(
+			nullptr,
+			VK_NULL_HANDLE,
+			VK_NULL_HANDLE,
+			VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+			m_pending_dlss_optical_flow_wait,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 	}
 	else
 	{
 		close_and_submit_command_buffer(nullptr,
 			m_current_frame->acquire_signal_semaphore,
 			m_current_frame->present_wait_semaphore,
-			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT);
+			VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+			m_pending_dlss_optical_flow_wait,
+			VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 	}
+	m_pending_dlss_optical_flow_wait = VK_NULL_HANDLE;
 
 	// Set up a present request for this frame as well
 	present(m_current_frame);
@@ -783,32 +797,132 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 
 	if (!m_upscaler || m_output_scaling != output_scaling)
 	{
+		if (m_upscaler && m_output_scaling != output_scaling)
+		{
+			m_temporal_frame_tracker.request_reset(vk::temporal_history_reset_reason::backend_changed);
+		}
+
 		m_output_scaling = output_scaling;
 
-		if (m_output_scaling == output_scaling_mode::nearest)
+		switch (m_output_scaling)
 		{
+		case output_scaling_mode::nearest:
 			m_upscaler = std::make_unique<vk::nearest_upscale_pass>();
-		}
-		else if (m_output_scaling == output_scaling_mode::fsr)
-		{
+			break;
+		case output_scaling_mode::fsr:
 			m_upscaler = std::make_unique<vk::fsr_upscale_pass>();
-		}
-		else
-		{
+			break;
+		case output_scaling_mode::dlss:
+#ifdef RPCS3_HAS_NVIDIA_DLSS
+			m_upscaler = std::make_unique<vk::dlss_upscale_pass>();
+#else
+			rsx_log.error("NVIDIA DLSS was selected, but this RPCS3 build was not configured with USE_NVIDIA_DLSS. Using bilinear scaling.");
 			m_upscaler = std::make_unique<vk::bilinear_upscale_pass>();
+#endif
+			break;
+		case output_scaling_mode::bilinear:
+		default:
+			m_upscaler = std::make_unique<vk::bilinear_upscale_pass>();
+			break;
 		}
 	}
+
+#ifdef RPCS3_HAS_NVIDIA_DLSS
+	if (image_to_flip && m_output_scaling == output_scaling_mode::dlss)
+	{
+		auto* dlss = static_cast<vk::dlss_upscale_pass*>(m_upscaler.get());
+		const size2u optical_flow_size{buffer_width, buffer_height};
+		if (dlss->prepare_optical_flow(
+				*m_current_command_buffer,
+				image_to_flip,
+				optical_flow_size,
+				m_current_queue_index,
+				m_max_async_frames))
+		{
+			const VkSemaphore graphics_ready = dlss->get_optical_flow_ready_semaphore();
+			ensure(graphics_ready != VK_NULL_HANDLE);
+			flush_command_queue(false, false, graphics_ready);
+			m_pending_dlss_optical_flow_wait = dlss->submit_optical_flow();
+			ensure(m_pending_dlss_optical_flow_wait != VK_NULL_HANDLE);
+		}
+	}
+#endif
 
 	if (image_to_flip)
 	{
 		const bool use_full_rgb_range_output = g_cfg.video.full_rgb_range_output.get();
+		vk::upscaler_frame_data upscaler_frame_data{};
+		const vk::upscaler_frame_data* upscaler_frame_data_ptr = nullptr;
+
+		if (m_output_scaling == output_scaling_mode::dlss)
+		{
+			m_temporal_frame_tracker.begin_frame(
+				upscaler_frame_data,
+				vk::get_current_frame_id(),
+				{buffer_width, buffer_height},
+				{static_cast<u32>(aspect_ratio.width()), static_cast<u32>(aspect_ratio.height())},
+				image_to_flip->format());
+			upscaler_frame_data.color = {
+				.image = image_to_flip,
+				.source = vk::temporal_resource_source::guest_render_target,
+				.active_size = {buffer_width, buffer_height},
+				.frame_id = upscaler_frame_data.frame_id,
+				.confidence = 1.f,
+			};
+			upscaler_frame_data_ptr = &upscaler_frame_data;
+			if (auto* depth_surface = m_rtts.m_bound_depth_stencil.second)
+			{
+				depth_surface->read_barrier(*m_current_command_buffer);
+				auto* depth = depth_surface->get_surface(rsx::surface_access::shader_read);
+				if (depth && depth->samples() == 1 &&
+					depth->width() >= buffer_width && depth->height() >= buffer_height)
+				{
+					upscaler_frame_data.depth = {
+						.image = depth,
+						.source = vk::temporal_resource_source::guest_render_target,
+						.active_size = {buffer_width, buffer_height},
+						.frame_id = upscaler_frame_data.frame_id,
+						.confidence = 1.f,
+					};
+					upscaler_frame_data.depth_inverted = false;
+				}
+			}
+
+#ifdef RPCS3_HAS_NVIDIA_DLSS
+			auto* dlss = static_cast<vk::dlss_upscale_pass*>(m_upscaler.get());
+			if (auto* motion_vectors = dlss->get_optical_flow_motion_vectors())
+			{
+				upscaler_frame_data.motion_vectors = {
+					.image = motion_vectors,
+					.source = vk::temporal_resource_source::optical_flow,
+					.active_size = {buffer_width, buffer_height},
+					.frame_id = upscaler_frame_data.frame_id,
+					.confidence = 0.65f,
+				};
+				upscaler_frame_data.motion_vector_scale_x = 1.f;
+				upscaler_frame_data.motion_vector_scale_y = 1.f;
+			}
+#endif
+			m_temporal_camera_capture.finalize_frame(upscaler_frame_data);
+			rsx::character_vertex_probe::finalize_motion_frame({
+				.frame_id = upscaler_frame_data.frame_id,
+				.render_width = upscaler_frame_data.render_size.width,
+				.render_height = upscaler_frame_data.render_size.height,
+				.current_view_projection = upscaler_frame_data.current_view_projection,
+				.previous_view_projection = upscaler_frame_data.previous_view_projection,
+				.camera_confidence = upscaler_frame_data.camera_matrix_confidence,
+				.has_camera_matrices = upscaler_frame_data.has_camera_matrices,
+				.reset_accumulation = upscaler_frame_data.reset_accumulation,
+				.camera_cut_detected = upscaler_frame_data.camera_cut_detected,
+			});
+		}
 
 		if (!use_full_rgb_range_output || !rsx::fcmp(avconfig.gamma, 1.f) || avconfig.stereo_enabled) [[unlikely]]
 		{
 			if (image_to_flip) calibration_src.push_back(image_to_flip);
 			if (image_to_flip2) calibration_src.push_back(image_to_flip2);
 
-			if (m_output_scaling == output_scaling_mode::fsr && !avconfig.stereo_enabled) // 3D will be implemented later
+			if ((m_output_scaling == output_scaling_mode::fsr || m_output_scaling == output_scaling_mode::dlss) && !avconfig.stereo_enabled) // 3D will be implemented later
 			{
 				// Run upscaling pass before the rest of the output effects pipeline
 				// This can be done with all upscalers but we already get bilinear upscaling for free if we just out the filters directly
@@ -823,7 +937,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 				for (unsigned i = 0; i < calibration_src.size(); ++i)
 				{
 					const rsx::flags32_t mode = (i == 0) ? UPSCALE_LEFT_VIEW : UPSCALE_RIGHT_VIEW;
-					calibration_src[i] = m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, request, mode);
+					calibration_src[i] = m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED, request, mode, upscaler_frame_data_ptr);
 				}
 			}
 
@@ -860,7 +974,7 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 				target_layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
 			}
 
-			m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, target_image, target_layout, rgn, UPSCALE_AND_COMMIT | UPSCALE_DEFAULT_VIEW);
+			m_upscaler->scale_output(*m_current_command_buffer, image_to_flip, target_image, target_layout, rgn, UPSCALE_AND_COMMIT | UPSCALE_DEFAULT_VIEW, upscaler_frame_data_ptr);
 		}
 	}
 
