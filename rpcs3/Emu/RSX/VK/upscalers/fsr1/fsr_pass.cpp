@@ -286,7 +286,8 @@ namespace vk
 		VkImage present_surface,
 		VkImageLayout present_surface_layout,
 		const VkImageBlit& request,
-		rsx::flags32_t mode)
+		rsx::flags32_t mode,
+		[[maybe_unused]] const upscaler_frame_data* frame_data)
 	{
 		size2u input_size, output_size;
 		input_size.width = std::abs(request.srcOffsets[1].x - request.srcOffsets[0].x);

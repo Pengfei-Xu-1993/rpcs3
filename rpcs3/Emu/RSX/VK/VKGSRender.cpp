@@ -1531,9 +1531,9 @@ void VKGSRender::clear_surface(u32 mask)
 	}
 }
 
-void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch)
+void VKGSRender::flush_command_queue(bool hard_sync, bool do_not_switch, VkSemaphore signal_semaphore)
 {
-	close_and_submit_command_buffer();
+	close_and_submit_command_buffer(nullptr, VK_NULL_HANDLE, signal_semaphore);
 
 	if (hard_sync)
 	{
@@ -2242,6 +2242,45 @@ void VKGSRender::upload_transform_constants(const rsx::io_buffer& buffer)
 	}
 }
 
+void VKGSRender::observe_temporal_camera_state()
+{
+	if (!m_temporal_camera_capture.enabled() || m_output_scaling != output_scaling_mode::dlss || !m_vertex_prog)
+		return;
+
+	const auto& ctx = REGS(m_ctx);
+	const auto& draw = ctx->current_draw_clause;
+	if (draw.empty() || draw.primitive < rsx::primitive_type::points || draw.primitive > rsx::primitive_type::polygon)
+		return;
+
+	// This function is called only after draw_clause::begin(). Accessing a
+	// range while the compiled clause is still parked at ~0u is invalid.
+	const u64 element_count = static_cast<u64>(draw.get_elements_count()) * draw.pass_count();
+	const float half_clip_width = static_cast<float>(ctx->surface_clip_width()) * 0.5f;
+	const float half_clip_height = static_cast<float>(ctx->surface_clip_height()) * 0.5f;
+	if (half_clip_width <= 0.f || half_clip_height <= 0.f)
+		return;
+
+	const std::array<float, 6> viewport_transform{
+		ctx->viewport_scale_x() / half_clip_width,
+		ctx->viewport_scale_y() / half_clip_height,
+		ctx->viewport_scale_z(),
+		(ctx->viewport_offset_x() - half_clip_width) / half_clip_width,
+		(ctx->viewport_offset_y() - half_clip_height) / half_clip_height,
+		ctx->viewport_offset_z(),
+	};
+	m_temporal_camera_capture.observe_draw(
+		vk::get_current_frame_id(),
+		ctx->transform_constants.data(),
+		::size32(ctx->transform_constants),
+		m_vertex_prog->constant_ids,
+		m_vertex_prog->has_indexed_constants || m_shader_interpreter.is_interpreter(m_program),
+		m_vertex_prog->id,
+		static_cast<u32>(std::min<u64>(element_count, umax)),
+		ctx->depth_test_enabled(),
+		ctx->depth_write_enabled(),
+		viewport_transform);
+}
+
 void VKGSRender::update_vertex_env(u32 id, const vk::vertex_upload_info& vertex_info)
 {
 #pragma pack(push, 1)
@@ -2345,7 +2384,13 @@ void VKGSRender::init_buffers(rsx::framebuffer_creation_context context, bool)
 	prepare_rtts(context);
 }
 
-void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore wait_semaphore, VkSemaphore signal_semaphore, VkPipelineStageFlags pipeline_stage_flags)
+void VKGSRender::close_and_submit_command_buffer(
+	vk::fence* pFence,
+	VkSemaphore wait_semaphore,
+	VkSemaphore signal_semaphore,
+	VkPipelineStageFlags pipeline_stage_flags,
+	VkSemaphore additional_wait_semaphore,
+	VkPipelineStageFlags additional_wait_stage)
 {
 	ensure(!m_queue_status.test_and_set(flush_queue_state::flushing));
 
@@ -2423,6 +2468,11 @@ void VKGSRender::close_and_submit_command_buffer(vk::fence* pFence, VkSemaphore 
 	if (wait_semaphore)
 	{
 		primary_submit_info.wait_on(wait_semaphore, pipeline_stage_flags);
+	}
+
+	if (additional_wait_semaphore)
+	{
+		primary_submit_info.wait_on(additional_wait_semaphore, additional_wait_stage);
 	}
 
 	if (auto async_scheduler = g_fxo->try_get<vk::AsyncTaskScheduler>();

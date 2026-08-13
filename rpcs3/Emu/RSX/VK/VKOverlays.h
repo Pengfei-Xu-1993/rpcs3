@@ -82,6 +82,8 @@ namespace vk
 
 		virtual std::vector<vk::glsl::program_input> get_vertex_inputs();
 		virtual std::vector<vk::glsl::program_input> get_fragment_inputs();
+		virtual std::vector<VkVertexInputBindingDescription> get_vertex_bindings();
+		virtual std::vector<VkVertexInputAttributeDescription> get_vertex_attributes();
 
 		virtual void get_dynamic_state_entries(std::vector<VkDynamicState>& /*state_descriptors*/) {}
 

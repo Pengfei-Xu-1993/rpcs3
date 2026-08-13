@@ -86,6 +86,16 @@ namespace vk
 		return fs_inputs;
 	}
 
+	std::vector<VkVertexInputBindingDescription> overlay_pass::get_vertex_bindings()
+	{
+		return {{0, 16, VK_VERTEX_INPUT_RATE_VERTEX}};
+	}
+
+	std::vector<VkVertexInputAttributeDescription> overlay_pass::get_vertex_attributes()
+	{
+		return {{0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0}};
+	}
+
 	vk::glsl::program* overlay_pass::build_pipeline(u64 storage_key, VkRenderPass render_pass)
 	{
 		if (!compiled)
@@ -120,14 +130,14 @@ namespace vk
 		dynamic_state_info.dynamicStateCount = ::size32(dynamic_state_descriptors);
 		dynamic_state_info.pDynamicStates = dynamic_state_descriptors.data();
 
-		VkVertexInputBindingDescription vb = { 0, 16, VK_VERTEX_INPUT_RATE_VERTEX };
-		VkVertexInputAttributeDescription via = { 0, 0, VK_FORMAT_R32G32B32A32_SFLOAT, 0 };
+		const auto vertex_bindings = get_vertex_bindings();
+		const auto vertex_attributes = get_vertex_attributes();
 		VkPipelineVertexInputStateCreateInfo vi = {};
 		vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-		vi.vertexBindingDescriptionCount = 1;
-		vi.pVertexBindingDescriptions = &vb;
-		vi.vertexAttributeDescriptionCount = 1;
-		vi.pVertexAttributeDescriptions = &via;
+		vi.vertexBindingDescriptionCount = ::size32(vertex_bindings);
+		vi.pVertexBindingDescriptions = vertex_bindings.data();
+		vi.vertexAttributeDescriptionCount = ::size32(vertex_attributes);
+		vi.pVertexAttributeDescriptions = vertex_attributes.data();
 
 		VkPipelineViewportStateCreateInfo vp = {};
 		vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
