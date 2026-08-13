@@ -424,7 +424,7 @@ class CompactOutputContractTests(unittest.TestCase):
             event.task_header_guest_ea = token
             event.task_context_guest_ea = token + 0x100
             event.dma_descriptor_guest_ea = token + 0x200
-            event.task_header_mfc_age = 2
+            event.task_header_mfc_age = 200 + event.sequence
             event.task_context_mfc_age = 1
             event.dma_descriptor_mfc_age = 0
 
@@ -437,6 +437,7 @@ class CompactOutputContractTests(unittest.TestCase):
             [field["coverage"] for field in diagnostics["fields"]],
             [1.0, 1.0, 1.0],
         )
+        self.assertGreater(diagnostics["fields"][0]["age_max"], 128)
         by_name = {item["candidate"]: item for item in result["top_candidates"]}
         self.assertEqual(by_name["mfc.task_header.absolute"]["decision"], "accept")
 
@@ -450,14 +451,35 @@ class CompactOutputContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             capture_path = pathlib.Path(directory) / "synthetic.bin"
             probe.write_synthetic_capture(capture_path)
+            raw = capture_path.read_bytes()
+            first_spu_header = probe.RECORD_HEADER.unpack_from(
+                raw, probe.FILE_HEADER.size + probe.EVENT_SIZE
+            )
             capture = probe.read_capture(capture_path)
         first = capture.spu[0]
+        self.assertEqual(
+            first_spu_header[4],
+            probe.EVENT_FLAG_AUTHORIZED | probe.EVENT_FLAG_MFC_PROVENANCE,
+        )
         self.assertEqual(first.mfc_provenance_mask, 7)
         self.assertTrue(first.task_header_guest_ea)
         self.assertEqual(
             (first.task_header_mfc_age, first.task_context_mfc_age, first.dma_descriptor_mfc_age),
             (2, 1, 0),
         )
+
+    def test_mfc_provenance_mask_preserves_guest_ea_zero(self) -> None:
+        event = self.capture.spu[0]
+        event.mfc_provenance_mask = 1
+        event.task_header_guest_ea = 0
+        spec = next(
+            item
+            for item in compact._candidate_specs(self.capture)
+            if item.name == "mfc.task_header.absolute"
+        )
+        self.assertEqual(spec.extractor(event), 0)
+        event.mfc_provenance_mask = 0
+        self.assertIsNone(spec.extractor(event))
 
     def test_anomalies_are_capped_per_kind(self) -> None:
         result = compact.analyze_capture_compact(self.capture, top_n=10, anomaly_limit=1)

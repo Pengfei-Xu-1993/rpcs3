@@ -33,6 +33,8 @@ EVENT_MAGIC = 0x45504C41
 EVENT_PPU = 1
 EVENT_SPU = 2
 EVENT_RSX = 3
+EVENT_FLAG_AUTHORIZED = 1 << 0
+EVENT_FLAG_MFC_PROVENANCE = 1 << 5
 SNAPSHOT_SPU_LS = 0x100
 SNAPSHOT_PPU_STACK = 0x101
 
@@ -689,11 +691,11 @@ def _pack_pointer(rule_id: int = 0, source: int = 0, address: int = 0, content_h
 
 def _pack_event(event_type: int, sequence: int, time_us: int, frame: int,
                 producer: int = 0, values: Iterable[int] = (), words: Iterable[int] = (),
-                pointers: Iterable[bytes] = ()) -> bytes:
+                pointers: Iterable[bytes] = (), flags: int = EVENT_FLAG_AUTHORIZED) -> bytes:
     values_list = list(values)[:32] + [0] * 32
     words_list = list(words)[:64] + [0] * 64
     pointer_list = list(pointers)[:8] + [_pack_pointer()] * 8
-    common = RECORD_HEADER.pack(EVENT_MAGIC, 1, event_type, EVENT_SIZE, 1, sequence,
+    common = RECORD_HEADER.pack(EVENT_MAGIC, 1, event_type, EVENT_SIZE, flags, sequence,
                                 time_us, frame, producer, 0x02000000, 0x928C, 0, 0xC490)
     return (common + VALUES.pack(*values_list[:32]) + WORDS.pack(*words_list[:64]) +
             b"".join(pointer_list[:8]))
@@ -724,7 +726,8 @@ def write_synthetic_capture(path: pathlib.Path) -> None:
             words[46:53] = [7, token, token + 0x100, token + 0x200, 2, 1, 0]
             events.append(_pack_event(EVENT_SPU, sequence, time_us, frame,
                                       values=values, words=words,
-                                      pointers=[_pack_pointer(1, 0x100000, token, token ^ 0xABCDEF)]))
+                                      pointers=[_pack_pointer(1, 0x100000, token, token ^ 0xABCDEF)],
+                                      flags=EVENT_FLAG_AUTHORIZED | EVENT_FLAG_MFC_PROVENANCE))
             sequence += 1
             rsx_words = [0] * 64
             rsx_words[1:4] = [11, 22, 512]

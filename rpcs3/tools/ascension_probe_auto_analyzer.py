@@ -64,10 +64,6 @@ def _nearest_ppu_pointer(
     return _pointer(event.nearest_ppu, rule_id) if event.nearest_ppu else None
 
 
-def _nonzero(value: int) -> int | None:
-    return value or None
-
-
 def _candidate_specs(capture: probe.Capture) -> list[CandidateSpec]:
     """Generate candidates from every field already present in the capture.
 
@@ -88,13 +84,39 @@ def _candidate_specs(capture: probe.Capture) -> list[CandidateSpec]:
 
     def add_address(
         prefix: str,
-        getter: Callable[[probe.SPUEvent], int],
+        getter: Callable[[probe.SPUEvent], int | None],
         category: str = "address",
+        allow_zero: bool = False,
     ) -> None:
-        add(f"{prefix}.absolute", category, lambda e, get=getter: _nonzero(get(e)))
-        add(f"{prefix}.aligned16", category, lambda e, get=getter: (get(e) & ~0xF) if get(e) else None, 0.99)
-        add(f"{prefix}.page", category, lambda e, get=getter: (get(e) >> 12) if get(e) else None, 0.98)
-        add(f"{prefix}.page_offset", category, lambda e, get=getter: (get(e) & 0xFFF) if get(e) else None, 0.98)
+        def value(event: probe.SPUEvent) -> int | None:
+            address = getter(event)
+            return address if address is not None and (allow_zero or address != 0) else None
+
+        add(f"{prefix}.absolute", category, value)
+        add(
+            f"{prefix}.aligned16",
+            category,
+            lambda e: (address & ~0xF)
+            if (address := value(e)) is not None
+            else None,
+            0.99,
+        )
+        add(
+            f"{prefix}.page",
+            category,
+            lambda e: (address >> 12)
+            if (address := value(e)) is not None
+            else None,
+            0.98,
+        )
+        add(
+            f"{prefix}.page_offset",
+            category,
+            lambda e: (address & 0xFFF)
+            if (address := value(e)) is not None
+            else None,
+            0.98,
+        )
 
     add_address("source0", lambda e: e.source0)
     add_address("source1", lambda e: e.source1)
@@ -102,18 +124,21 @@ def _candidate_specs(capture: probe.Capture) -> list[CandidateSpec]:
     add_address("output", lambda e: e.output_start, "output_address")
     add_address(
         "mfc.task_header",
-        lambda e: e.task_header_guest_ea if e.mfc_provenance_mask & 1 else 0,
+        lambda e: e.task_header_guest_ea if e.mfc_provenance_mask & 1 else None,
         "mfc_provenance",
+        allow_zero=True,
     )
     add_address(
         "mfc.task_context",
-        lambda e: e.task_context_guest_ea if e.mfc_provenance_mask & 2 else 0,
+        lambda e: e.task_context_guest_ea if e.mfc_provenance_mask & 2 else None,
         "mfc_provenance",
+        allow_zero=True,
     )
     add_address(
         "mfc.dma_descriptor",
-        lambda e: e.dma_descriptor_guest_ea if e.mfc_provenance_mask & 4 else 0,
+        lambda e: e.dma_descriptor_guest_ea if e.mfc_provenance_mask & 4 else None,
         "mfc_provenance",
+        allow_zero=True,
     )
     add("output.frame_relative", "output_derived", lambda e: e.output_frame_relative if e.output_start else None)
     add("output.size", "pipeline_metadata", lambda e: e.output_end - e.output_start if e.output_end > e.output_start else None)

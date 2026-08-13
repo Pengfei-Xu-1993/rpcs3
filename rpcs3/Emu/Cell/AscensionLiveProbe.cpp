@@ -135,7 +135,7 @@ namespace ascension::live_probe
 			std::atomic<bool> armed{false};
 			std::atomic<bool> capturing{false};
 			std::atomic<bool> stopping{false};
-			std::atomic<u32> mfc_provenance_epoch{1};
+			std::atomic<u64> mfc_provenance_epoch{1};
 			std::atomic<u64> ppu_gate{0};
 			std::atomic<u64> current_frame{0};
 			std::atomic<u32> current_rsx_draw_sequence{0};
@@ -915,27 +915,17 @@ namespace ascension::live_probe
 			bool found = false;
 		};
 
-		mfc_provenance_match resolve_mfc_provenance(const spu_thread& spu, u32 target_lsa, u32 epoch)
+		mfc_provenance_match resolve_mfc_provenance(spu_thread& spu, u32 target_lsa, u32 size, u64 epoch)
 		{
-			constexpr u32 capacity = spu_thread::ascension_mfc_get_provenance_capacity;
-			static_assert((capacity & (capacity - 1)) == 0);
-			if (target_lsa >= SPU_LS_SIZE)
-				return {};
+			const auto match = spu.ascension_mfc_get_provenance.resolve(target_lsa, size, epoch);
+			return {match.guest_ea, match.age, match.found};
+		}
 
-			const u32 next = spu.ascension_mfc_get_provenance_next;
-			const u32 count = std::min(next, capacity);
-			for (u32 age = 0; age < count; ++age)
-			{
-				const auto& entry = spu.ascension_mfc_get_provenance[(next - 1 - age) & (capacity - 1)];
-				if (entry.epoch != epoch || target_lsa < entry.lsa)
-					continue;
-				const u32 offset = target_lsa - entry.lsa;
-				const u32 guest_ea = entry.eal + offset;
-				if (offset >= entry.size || guest_ea < entry.eal)
-					continue;
-				return {guest_ea, spu.ascension_mfc_get_provenance_order - entry.order, true};
-			}
-			return {};
+		bool provenance_matches_ls(const spu_thread& spu, const mfc_provenance_match& match, u32 lsa, u32 size)
+		{
+			return match.found && range_valid(pointer_space::spu_ls, &spu, lsa, size) &&
+				range_valid(pointer_space::guest, nullptr, match.guest_ea, size) &&
+				std::memcmp(spu.ls + lsa, vm::base(match.guest_ea), size) == 0;
 		}
 	}
 
@@ -993,12 +983,11 @@ namespace ascension::live_probe
 		}
 
 		probe_state& probe = state();
-		constexpr u32 capacity = spu_thread::ascension_mfc_get_provenance_capacity;
-		const u32 next = spu->ascension_mfc_get_provenance_next;
-		auto& entry = spu->ascension_mfc_get_provenance[next & (capacity - 1)];
-		const u32 order = ++spu->ascension_mfc_get_provenance_order;
-		entry = {lsa, eal, size, probe.mfc_provenance_epoch.load(std::memory_order_acquire), order};
-		spu->ascension_mfc_get_provenance_next = next + 1;
+		spu->ascension_mfc_get_provenance.record(
+			lsa,
+			eal,
+			size,
+			probe.mfc_provenance_epoch.load(std::memory_order_acquire));
 	}
 
 	std::atomic<u64>* ppu_gate_address()
@@ -1135,10 +1124,16 @@ namespace ascension::live_probe
 		if (!event_allowed(probe))
 			return;
 
-		const u32 provenance_epoch = probe.mfc_provenance_epoch.load(std::memory_order_acquire);
-		const auto task_header_provenance = resolve_mfc_provenance(*spu, task_header_lsa, provenance_epoch);
-		const auto task_context_provenance = resolve_mfc_provenance(*spu, task_context_lsa, provenance_epoch);
-		const auto dma_descriptor_provenance = resolve_mfc_provenance(*spu, dma_descriptor_lsa, provenance_epoch);
+		const u64 provenance_epoch = probe.mfc_provenance_epoch.load(std::memory_order_acquire);
+		auto task_header_provenance = resolve_mfc_provenance(*spu, task_header_lsa, 0x38, provenance_epoch);
+		auto task_context_provenance = resolve_mfc_provenance(*spu, task_context_lsa, 0x0c, provenance_epoch);
+		auto dma_descriptor_provenance = resolve_mfc_provenance(*spu, dma_descriptor_lsa, 0x10, provenance_epoch);
+		if (!provenance_matches_ls(*spu, task_header_provenance, task_header_lsa, 0x38))
+			task_header_provenance = {};
+		if (!provenance_matches_ls(*spu, task_context_provenance, task_context_lsa, 0x0c))
+			task_context_provenance = {};
+		if (!provenance_matches_ls(*spu, dma_descriptor_provenance, dma_descriptor_lsa, 0x10))
+			dma_descriptor_provenance = {};
 
 		event_record_v1 event{};
 		event.header.type = static_cast<u16>(event_type::spu_task);

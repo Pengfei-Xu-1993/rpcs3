@@ -2048,11 +2048,6 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 	u32 eal = args.eal;
 	u32 lsa = args.lsa & 0x3ffff;
 
-	if (is_get)
-	{
-		ascension::live_probe::record_spu_mfc_get(_this, lsa, eal, args.size);
-	}
-
 	// Keep src point to const
 	u8* dst = nullptr;
 	const u8* src = nullptr;
@@ -2301,6 +2296,10 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 					dump.block_hash = _this->block_hash;
 					std::memcpy(dump.data, is_get ? dst : src, std::min<u32>(args.size, 128));
 				}
+				if (is_get)
+				{
+					ascension::live_probe::record_spu_mfc_get(_this, lsa, args.eal, args.size);
+				}
 
 				return;
 			}
@@ -2499,6 +2498,10 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 				dump.cmd.eah = _this->pc;
 				dump.block_hash = _this->block_hash;
 				std::memcpy(dump.data, is_get ? dst : src, std::min<u32>(args.size, 128));
+			}
+			if (is_get)
+			{
+				ascension::live_probe::record_spu_mfc_get(_this, lsa, args.eal, args.size);
 			}
 
 			return;
@@ -2704,6 +2707,10 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 			dump.block_hash = _this->block_hash;
 			std::memcpy(dump.data, is_get ? dst : src, std::min<u32>(args.size, 128));
 		}
+		if (is_get)
+		{
+			ascension::live_probe::record_spu_mfc_get(_this, lsa, args.eal, args.size);
+		}
 
 		return;
 	}
@@ -2780,6 +2787,10 @@ plain_access:
 		dump.cmd.eah = _this->pc;
 		dump.block_hash = _this->block_hash;
 		std::memcpy(dump.data, is_get ? dst : src, std::min<u32>(args.size, 128));
+	}
+	if (is_get)
+	{
+		ascension::live_probe::record_spu_mfc_get(_this, lsa, args.eal, args.size);
 	}
 }
 
@@ -2873,7 +2884,7 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 	// Both the six-item and single-item GET-list fast paths bypass
 	// do_dma_transfer(). Route an authorized, armed probe through the shared
 	// runtime transfer path so dynamic list arguments receive provenance too.
-	if (ascension::live_probe::mfc_provenance_enabled())
+	if (optimization_compatible == MFC_GET_CMD && ascension::live_probe::mfc_provenance_enabled())
 	{
 		optimization_compatible = 0;
 	}
@@ -4287,6 +4298,7 @@ bool spu_thread::process_mfc_cmd()
 			raddr = last_faddr;
 			last_ftime = 0;
 			mov_rdata(_ref<spu_rdata_t>(ch_mfc_cmd.lsa & 0x3ff80), rdata);
+			ascension::live_probe::record_spu_mfc_get(this, ch_mfc_cmd.lsa & 0x3ff80, addr, 128);
 
 			ch_atomic_stat.set_value(MFC_GETLLAR_SUCCESS);
 			return true;
@@ -4316,6 +4328,7 @@ bool spu_thread::process_mfc_cmd()
 				if (this_time % 128 == 0 && cmp_rdata(rdata, data))
 				{
 					mov_rdata(_ref<spu_rdata_t>(ch_mfc_cmd.lsa & 0x3ff80), rdata);
+					ascension::live_probe::record_spu_mfc_get(this, ch_mfc_cmd.lsa & 0x3ff80, addr, 128);
 					ch_atomic_stat.set_value(MFC_GETLLAR_SUCCESS);
 
 					// Need to check twice for it to be accurate, the code is before and not after this check for:
@@ -4622,6 +4635,7 @@ bool spu_thread::process_mfc_cmd()
 		raddr = addr;
 		rtime = ntime;
 		mov_rdata(_ref<spu_rdata_t>(ch_mfc_cmd.lsa & 0x3ff80), rdata);
+		ascension::live_probe::record_spu_mfc_get(this, ch_mfc_cmd.lsa & 0x3ff80, addr, 128);
 
 		ch_atomic_stat.set_value(MFC_GETLLAR_SUCCESS);
 

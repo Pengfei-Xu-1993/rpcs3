@@ -108,17 +108,31 @@ eight 56-byte pointer-follow results.
 - `words[45]`: pointer-result count.
 - `words[46]`: runtime MFC GET provenance mask (`bit0=task header`,
   `bit1=task context`, `bit2=DMA descriptor`).
-- `words[47..49]`: guest EAs corresponding to the three LS addresses when the
-  most recent covering GET is present in the same SPU's fixed provenance ring.
+- `words[47..49]`: guest EAs corresponding to the three LS structures when all
+  required bytes have one consistent mapping in the same SPU's fixed
+  16-byte-granularity provenance table and still match guest memory.
 - `words[50..52]`: number of recorded GET transfers since each matched source
-  transfer. These fields are aggregate diagnostics, not a PPU owner token.
+  transfer. For same-bias partial writes the value conservatively follows the
+  oldest surviving contribution in a granule, so it may overestimate age.
+  These fields are aggregate diagnostics, not a PPU owner token.
 - Event flag bit 5 is set when at least one provenance-mask bit is present.
 
 While the exact executable is authorized and capture is armed, GET-list
 inlining is disabled so dynamic direct transfers, six-item list batches, and
-single-item list transfers all pass through the same runtime recorder. The
-ring is reset logically by an epoch on every `ARM`; old ABI-v1 captures decode
-these reserved words as zero.
+single-item list transfers all pass through the same runtime recorder. PUT-list
+optimization is unaffected. Successful GETLLAR writes are recorded as 128-byte
+GET sources too.
+
+The fixed per-SPU table uses one exact byte-valid mask for each 16-byte LS
+granule. It retains a mapping until another recorded GET overwrites that LS
+region or a new `ARM` epoch begins, so unrelated transfers cannot evict it.
+Different-bias partial writes conservatively invalidate the other bytes in the
+granule rather than fabricate a mixed mapping. Resolution covers the complete
+observed structure spans (header `0x38`, context `0x0c`, descriptor `0x10`) and
+requires byte-for-byte equality between the current LS span and the derived
+guest span. Ordinary SPU stores are not intercepted, so these fields remain
+diagnostic last-GET evidence rather than a standalone object-ownership proof.
+Old ABI-v1 captures decode the reserved words as zero.
 
 ### RSX draw event (`type=3`)
 
