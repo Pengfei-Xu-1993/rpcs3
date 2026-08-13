@@ -180,6 +180,7 @@ endif()
 # Cell
 target_sources(rpcs3_emu PRIVATE
     Cell/ErrorCodes.cpp
+	Cell/AscensionLiveProbe.cpp
 	Cell/AscensionSpuTaskProbe.cpp
     Cell/MFC.cpp
     Cell/PPUAnalyser.cpp

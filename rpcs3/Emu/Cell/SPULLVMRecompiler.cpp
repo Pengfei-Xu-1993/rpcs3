@@ -14,6 +14,7 @@
 #include "SPUThread.h"
 #include "SPUAnalyser.h"
 #include "SPUInterpreter.h"
+#include "AscensionLiveProbe.h"
 #include "AscensionSpuTaskProbe.h"
 #include <algorithm>
 #include <thread>
@@ -10238,6 +10239,55 @@ public:
 	void BRSL(spu_opcode_t op) //
 	{
 		const u32 target = spu_branch_target(m_pos, op.i16);
+
+		// The Live Probe cache contains one runtime gate at the verified task
+		// call. It records no payload and makes no host call while disarmed.
+		if (!m_interp_magn && ascension::live_probe::bootstrap_enabled() &&
+			ascension::live_probe::authorized() &&
+			m_pos == ascension::spu_task_probe::task_call_pc &&
+			target == ascension::spu_task_probe::task_dma_target_pc)
+		{
+			const auto task_header_lsa = eval(extract(get_reg_fixed<u32[4]>(84), 3));
+			const auto task_context_lsa = eval(extract(get_reg_fixed<u32[4]>(90), 3));
+			const auto dma_descriptor_lsa = eval(extract(get_reg_fixed<u32[4]>(95), 3));
+			auto* gate_pointer = m_ir->CreateIntToPtr(
+				m_ir->getInt64(reinterpret_cast<u64>(ascension::live_probe::ppu_gate_address())),
+				get_type<u64*>());
+			auto* gate = m_ir->CreateLoad(get_type<u64>(), gate_pointer);
+			gate->setAtomic(llvm::AtomicOrdering::Acquire);
+			gate->setAlignment(llvm::Align(8));
+			const auto publish = llvm::BasicBlock::Create(m_context, "ascension.live_probe.spu.publish", m_function);
+			const auto next = llvm::BasicBlock::Create(m_context, "ascension.live_probe.spu.next", m_function);
+			m_ir->CreateCondBr(
+				m_ir->CreateICmpNE(m_ir->CreateAnd(gate, m_ir->getInt64(1ull << 63)), m_ir->getInt64(0)),
+				publish,
+				next,
+				m_md_unlikely);
+
+			m_ir->SetInsertPoint(publish);
+			const auto register_type = llvm::ArrayType::get(get_type<u32>(), 128);
+			const auto registers = m_ir->CreateAlloca(register_type);
+			for (u32 reg = 0; reg < 128; ++reg)
+			{
+				const auto address = m_ir->CreateInBoundsGEP(
+					register_type,
+					registers,
+					{m_ir->getInt32(0), m_ir->getInt32(reg)});
+				m_ir->CreateStore(extract(get_reg_fixed<u32[4]>(reg), 3).eval(m_ir), address);
+			}
+			call(
+				"ascension_live_probe_spu_task",
+				&ascension::live_probe::observe_spu_task,
+				m_thread,
+				m_ir->getInt32(m_pos),
+				m_ir->getInt32(target),
+				task_header_lsa.value,
+				task_context_lsa.value,
+				dma_descriptor_lsa.value,
+				registers);
+			m_ir->CreateBr(next);
+			m_ir->SetInsertPoint(next);
+		}
 
 		// BCAS25016 v1.12: keep the original BRSL and observe only verified
 		// character tasks. The task-format comparison is generated directly in

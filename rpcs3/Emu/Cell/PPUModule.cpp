@@ -14,6 +14,7 @@
 
 #include "Emu/Cell/PPUOpcodes.h"
 #include "Emu/Cell/SPUThread.h"
+#include "Emu/Cell/AscensionLiveProbe.h"
 #include "Emu/Cell/AscensionSpuTaskProbe.h"
 #include "Emu/Cell/PPUAnalyser.h"
 #include "Emu/Cell/timers.hpp"
@@ -2325,6 +2326,7 @@ bool ppu_load_exec(const ppu_exec_object& elf, bool virtual_load, const std::str
 	}
 
 	Emu.SetExecutableHash(hash);
+	ascension::live_probe::authorize_executable(hash);
 
 	// Apply the patch
 	std::vector<u32> applied;

@@ -1,4 +1,5 @@
 #include "stdafx.h"
+#include "Emu/Cell/AscensionLiveProbe.h"
 #include "Emu/Cell/AscensionSpuTaskProbe.h"
 #include "../Common/BufferUtils.h"
 #include "../Core/CharacterVertexProbe.h"
@@ -956,6 +957,7 @@ void VKGSRender::emit_geometry(u32 sub_index)
 {
 	auto &draw_call = rsx::method_registers.current_draw_clause;
 	m_profiler.start();
+	const u32 live_probe_draw_sequence = ascension::live_probe::report_frame(vk::get_current_frame_id());
 
 	const rsx::flags32_t vertex_state_mask = rsx::vertex_base_changed | rsx::vertex_arrays_changed;
 	const rsx::flags32_t state_flags = (sub_index == 0) ? rsx::vertex_arrays_changed : draw_call.execute_pipeline_dependencies(m_ctx);
@@ -1005,10 +1007,16 @@ void VKGSRender::emit_geometry(u32 sub_index)
 		return;
 	}
 
-	if ((rsx::character_vertex_probe::spu_writer_enabled() || rsx::character_vertex_probe::rsx_draw_enabled()) && m_vertex_prog &&
+	const bool old_character_candidate =
+		(rsx::character_vertex_probe::spu_writer_enabled() || rsx::character_vertex_probe::rsx_draw_enabled()) &&
 		m_vertex_layout.attribute_mask == 0xc3b5 &&
 		upload_info.vertex_draw_count >= 128 && upload_info.vertex_draw_count <= 8192 &&
-		draw_call.primitive >= rsx::primitive_type::triangles && draw_call.primitive <= rsx::primitive_type::polygon)
+		draw_call.primitive >= rsx::primitive_type::triangles && draw_call.primitive <= rsx::primitive_type::polygon;
+	const bool live_probe_candidate = ascension::live_probe::rsx_candidate_enabled(
+		m_vertex_layout.attribute_mask,
+		upload_info.vertex_draw_count,
+		static_cast<u8>(draw_call.primitive));
+	if (m_vertex_prog && (old_character_candidate || live_probe_candidate))
 	{
 		std::span<const std::byte> raw_index_buffer;
 		u32 index_address = 0;
@@ -1044,84 +1052,123 @@ void VKGSRender::emit_geometry(u32 sub_index)
 			const u64 size = static_cast<u64>(block->vertex_range.second) * block->attribute_stride;
 			if (address <= umax && size <= umax)
 			{
-				ascension::spu_task_probe::output_identity task_identity{};
-				const bool has_task_identity = ascension::spu_task_probe::identify_output_range(
-					static_cast<u32>(address),
-					static_cast<u32>(size),
-					task_identity);
-				if (rsx::character_vertex_probe::task_identity_required() && !has_task_identity)
-					continue;
-
-				if (rsx::character_vertex_probe::spu_writer_enabled())
+				if (old_character_candidate)
 				{
-					rsx::character_vertex_probe::watch_vertex_range(
-						vk::get_current_frame_id(),
-						m_vertex_prog->id,
-						upload_info.vertex_draw_count,
-						m_vertex_layout.attribute_mask,
-						block->attribute_stride,
+					ascension::spu_task_probe::output_identity task_identity{};
+					const bool has_task_identity = ascension::spu_task_probe::identify_output_range(
 						static_cast<u32>(address),
-						static_cast<u32>(size));
-				}
-				else
-				{
-					rsx::character_vertex_probe::rsx_draw_desc desc{};
-					desc.frame_id = vk::get_current_frame_id();
-					desc.vertex_program_id = m_vertex_prog->id;
-					desc.fragment_program_id = m_fragment_prog ? m_fragment_prog->id : 0;
-					desc.vertex_draw_count = upload_info.vertex_draw_count;
-					desc.stream_vertex_count = block->vertex_range.second;
-					desc.first_vertex = block->vertex_range.first;
-					desc.stream_address = static_cast<u32>(address);
-					desc.stream_size = static_cast<u32>(size);
-					desc.index_address = index_address;
-					desc.index_count = raw_index_buffer.empty() ? 0 : static_cast<u32>(raw_index_buffer.size_bytes() / get_index_type_size(static_cast<rsx::index_array_type>(index_type)));
-					desc.attribute_mask = m_vertex_layout.attribute_mask;
-					desc.stride = block->attribute_stride;
-					desc.primitive = static_cast<u8>(draw_call.primitive);
-					desc.command = static_cast<u8>(draw_call.command);
-					desc.index_type = index_type;
-					desc.indexed_constants = m_vertex_prog->has_indexed_constants || m_shader_interpreter.is_interpreter(m_program);
-					desc.restart_index_enabled = rsx::method_registers.restart_index_enabled();
-					desc.restart_index = rsx::method_registers.restart_index();
-					if (has_task_identity)
+						static_cast<u32>(size),
+						task_identity);
+					if (!rsx::character_vertex_probe::task_identity_required() || has_task_identity)
 					{
-						desc.task_sequence = task_identity.task_sequence;
-						desc.task_format = task_identity.task_format;
-						desc.task_packed_count = task_identity.packed_count;
-						desc.task_source_ea = task_identity.source_ea_0;
-						desc.task_output_relative_offset = task_identity.output_relative_offset;
-						desc.task_overlap_bytes = task_identity.overlap_bytes;
-						desc.task_identity_valid = true;
-					}
+						if (rsx::character_vertex_probe::spu_writer_enabled())
+						{
+							rsx::character_vertex_probe::watch_vertex_range(
+								vk::get_current_frame_id(), m_vertex_prog->id, upload_info.vertex_draw_count,
+								m_vertex_layout.attribute_mask, block->attribute_stride,
+								static_cast<u32>(address), static_cast<u32>(size));
+						}
+						else
+						{
+							rsx::character_vertex_probe::rsx_draw_desc desc{};
+							desc.frame_id = vk::get_current_frame_id();
+							desc.vertex_program_id = m_vertex_prog->id;
+							desc.fragment_program_id = m_fragment_prog ? m_fragment_prog->id : 0;
+							desc.vertex_draw_count = upload_info.vertex_draw_count;
+							desc.stream_vertex_count = block->vertex_range.second;
+							desc.first_vertex = block->vertex_range.first;
+							desc.stream_address = static_cast<u32>(address);
+							desc.stream_size = static_cast<u32>(size);
+							desc.index_address = index_address;
+							desc.index_count = raw_index_buffer.empty() ? 0 : static_cast<u32>(raw_index_buffer.size_bytes() / get_index_type_size(static_cast<rsx::index_array_type>(index_type)));
+							desc.attribute_mask = m_vertex_layout.attribute_mask;
+							desc.stride = block->attribute_stride;
+							desc.primitive = static_cast<u8>(draw_call.primitive);
+							desc.command = static_cast<u8>(draw_call.command);
+							desc.index_type = index_type;
+							desc.indexed_constants = m_vertex_prog->has_indexed_constants || m_shader_interpreter.is_interpreter(m_program);
+							desc.restart_index_enabled = rsx::method_registers.restart_index_enabled();
+							desc.restart_index = rsx::method_registers.restart_index();
+							if (has_task_identity)
+							{
+								desc.task_sequence = task_identity.task_sequence;
+								desc.task_format = task_identity.task_format;
+								desc.task_packed_count = task_identity.packed_count;
+								desc.task_source_ea = task_identity.source_ea_0;
+								desc.task_output_relative_offset = task_identity.output_relative_offset;
+								desc.task_overlap_bytes = task_identity.overlap_bytes;
+								desc.task_identity_valid = true;
+							}
 
+							for (const auto& location : block->locations)
+							{
+								if (desc.attribute_count >= desc.attributes.size()) break;
+								const auto& format = rsx::method_registers.vertex_arrays_info[location.index];
+								const u32 attribute_address = format.offset() & 0x7fffffffu;
+								if (attribute_address < block->base_offset) continue;
+								auto& attribute = desc.attributes[desc.attribute_count++];
+								attribute.index = location.index;
+								attribute.type = static_cast<u8>(format.type());
+								attribute.component_count = format.size();
+								attribute.byte_size = static_cast<u8>(rsx::get_vertex_type_size_on_host(format.type(), format.size()));
+								attribute.offset = static_cast<u16>(attribute_address - block->base_offset);
+								attribute.frequency = location.frequency;
+								attribute.modulo = location.modulo;
+							}
+
+							rsx::character_vertex_probe::observe_rsx_draw(
+								desc, vm::_ptr<const u8>(desc.stream_address), raw_index_buffer.data(),
+								static_cast<u32>(raw_index_buffer.size_bytes()),
+								rsx::method_registers.transform_constants.data(),
+								m_vertex_prog->constant_ids.data(), ::size32(m_vertex_prog->constant_ids));
+						}
+					}
+				}
+
+				if (live_probe_candidate)
+				{
+					ascension::live_probe::rsx_draw_event event{};
+					event.frame_id = vk::get_current_frame_id();
+					event.draw_sequence = live_probe_draw_sequence;
+					event.vertex_program_id = m_vertex_prog->id;
+					event.fragment_program_id = m_fragment_prog ? m_fragment_prog->id : 0;
+					event.vertex_draw_count = upload_info.vertex_draw_count;
+					event.stream_vertex_count = block->vertex_range.second;
+					event.first_vertex = block->vertex_range.first;
+					event.stream_address = static_cast<u32>(address);
+					event.stream_size = static_cast<u32>(size);
+					event.index_address = index_address;
+					event.index_count = raw_index_buffer.empty() ? 0 : static_cast<u32>(raw_index_buffer.size_bytes() / get_index_type_size(static_cast<rsx::index_array_type>(index_type)));
+					event.attribute_mask = m_vertex_layout.attribute_mask;
+					event.stride = block->attribute_stride;
+					event.primitive = static_cast<u8>(draw_call.primitive);
+					event.command = static_cast<u8>(draw_call.command);
+					event.index_type = index_type;
+					event.indexed_constants = m_vertex_prog->has_indexed_constants || m_shader_interpreter.is_interpreter(m_program);
+					event.restart_index_enabled = rsx::method_registers.restart_index_enabled();
+					event.restart_index = rsx::method_registers.restart_index();
+					auto hash_append = [](u64 hash, const void* bytes, usz length)
+					{
+						const auto* data = static_cast<const u8*>(bytes);
+						for (usz i = 0; i < length; ++i) { hash ^= data[i]; hash *= 1099511628211ull; }
+						return hash;
+					};
+					event.index_hash = raw_index_buffer.empty() ? 0 : hash_append(1469598103934665603ull, raw_index_buffer.data(), raw_index_buffer.size_bytes());
+					u64 layout_hash = 1469598103934665603ull;
+					layout_hash = hash_append(layout_hash, &event.attribute_mask, sizeof(event.attribute_mask));
+					layout_hash = hash_append(layout_hash, &event.stride, sizeof(event.stride));
 					for (const auto& location : block->locations)
 					{
-						if (desc.attribute_count >= desc.attributes.size())
-							break;
 						const auto& format = rsx::method_registers.vertex_arrays_info[location.index];
-						const u32 attribute_address = format.offset() & 0x7fffffffu;
-						if (attribute_address < block->base_offset)
-							continue;
-
-						auto& attribute = desc.attributes[desc.attribute_count++];
-						attribute.index = location.index;
-						attribute.type = static_cast<u8>(format.type());
-						attribute.component_count = format.size();
-						attribute.byte_size = static_cast<u8>(rsx::get_vertex_type_size_on_host(format.type(), format.size()));
-						attribute.offset = static_cast<u16>(attribute_address - block->base_offset);
-						attribute.frequency = location.frequency;
-						attribute.modulo = location.modulo;
+						const std::array<u32, 5> fields{
+							location.index, static_cast<u32>(format.type()), format.size(),
+							format.offset() & 0x7fffffffu, location.frequency};
+						layout_hash = hash_append(layout_hash, fields.data(), sizeof(fields));
 					}
-
-					rsx::character_vertex_probe::observe_rsx_draw(
-						desc,
-						vm::_ptr<const u8>(desc.stream_address),
-						raw_index_buffer.data(),
-						static_cast<u32>(raw_index_buffer.size_bytes()),
-						rsx::method_registers.transform_constants.data(),
-						m_vertex_prog->constant_ids.data(),
-						::size32(m_vertex_prog->constant_ids));
+					event.layout_hash = layout_hash;
+					event.task_valid = ascension::live_probe::identify_output_range(
+					static_cast<u32>(address), static_cast<u32>(size), event.task);
+					ascension::live_probe::observe_rsx_draw(event);
 				}
 			}
 		}

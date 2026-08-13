@@ -17,6 +17,7 @@ class PPUTranslator final : public cpu_translator
 {
 	// PPU Module
 	const ppu_module<lv2_obj>& m_info;
+	const bool m_ascension_live_probe_module;
 
 	// Relevant relocations
 	std::map<u64, const ppu_reloc*> m_relocs;
@@ -154,6 +155,11 @@ public:
 
 	// Emit function call
 	void CallFunction(u64 target, llvm::Value* indirect = nullptr);
+
+	// Emit the runtime-gated Ascension PPU call observer. This is compiled only
+	// in the dedicated Live Probe cache; changing the selected PC never requires
+	// recompiling guest code.
+	void EmitAscensionLiveProbeCall(llvm::Value* target, llvm::Value* caller_lr);
 
 	// Emit state check mid-block
 	void TestAborted();
