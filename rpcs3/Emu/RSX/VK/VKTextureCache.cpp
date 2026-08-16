@@ -1334,15 +1334,40 @@ namespace vk
 		vk::command_buffer& cmd,
 		const utils::address_range32& rsx_range,
 		const rsx::image_section_attributes_t& attributes,
-		const rsx::texture_replacements::image& replacement)
+		const rsx::texture_replacements::replacement_texture& replacement)
 	{
 		const auto& limits = m_device->gpu().get_limits();
-		if (!replacement.width || !replacement.height ||
-			replacement.width > limits.maxImageDimension2D ||
-			replacement.height > limits.maxImageDimension2D ||
-			replacement.rgba.size() != static_cast<usz>(replacement.width) * replacement.height * 4)
+		const u32 replacement_width = replacement.width();
+		const u32 replacement_height = replacement.height();
+		const u32 replacement_mipmaps = ::size32(replacement.levels);
+		const bool rgba = replacement.encoding == rsx::texture_replacements::replacement_encoding::rgba8;
+		const bool bc1 = replacement.encoding == rsx::texture_replacements::replacement_encoding::bc1;
+		const bool bc2 = replacement.encoding == rsx::texture_replacements::replacement_encoding::bc2;
+		const bool bc3 = replacement.encoding == rsx::texture_replacements::replacement_encoding::bc3;
+		const u32 block_size = bc1 ? 8 : (rgba ? 4 : 16);
+		if (!replacement_width || !replacement_height || !replacement_mipmaps || replacement_mipmaps > 16 ||
+			replacement_width > limits.maxImageDimension2D || replacement_height > limits.maxImageDimension2D ||
+			replacement_width > std::numeric_limits<u16>::max() || replacement_height > std::numeric_limits<u16>::max() ||
+			(rgba && (replacement_mipmaps != 1 || replacement.gcm_format != CELL_GCM_TEXTURE_A8R8G8B8)) ||
+			(bc1 && replacement.gcm_format != CELL_GCM_TEXTURE_COMPRESSED_DXT1) ||
+			(bc2 && replacement.gcm_format != CELL_GCM_TEXTURE_COMPRESSED_DXT23) ||
+			(bc3 && replacement.gcm_format != CELL_GCM_TEXTURE_COMPRESSED_DXT45) ||
+			(!rgba && !bc1 && !bc2 && !bc3))
 		{
 			return nullptr;
+		}
+		for (usz index = 0; index < replacement.levels.size(); ++index)
+		{
+			const auto& level = replacement.levels[index];
+			const u32 expected_width = std::max<u32>(1, replacement_width >> index);
+			const u32 expected_height = std::max<u32>(1, replacement_height >> index);
+			const u32 blocks_x = rgba ? expected_width : std::max<u32>(1, (expected_width + 3) / 4);
+			const u32 blocks_y = rgba ? expected_height : std::max<u32>(1, (expected_height + 3) / 4);
+			const u64 expected_size = static_cast<u64>(blocks_x) * blocks_y * block_size;
+			if (level.width != expected_width || level.height != expected_height || level.data.size() != expected_size)
+			{
+				return nullptr;
+			}
 		}
 
 		const rsx::image_section_attributes_t search_desc
@@ -1361,22 +1386,32 @@ namespace vk
 			region.destroy();
 		}
 
-		constexpr VkFormat image_format = VK_FORMAT_B8G8R8A8_UNORM;
+		const VkFormat image_format = get_compatible_sampler_format(m_formats_support, replacement.gcm_format);
 		constexpr VkImageType image_type = VK_IMAGE_TYPE_2D;
 		constexpr VkImageUsageFlags usage_flags = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 		constexpr VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
-		const VkImageCreateFlags create_flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+		VkImageCreateFlags create_flags = 0;
 
-		rsx::simple_array<VkFormat> mutable_formats
+		rsx::simple_array<VkFormat> mutable_formats;
+		const VkFormat snorm_format = get_compatible_snorm_format(image_format);
+		const VkFormat srgb_format = get_compatible_srgb_format(image_format);
+		if (snorm_format != VK_FORMAT_UNDEFINED)
 		{
-			VK_FORMAT_B8G8R8A8_SNORM,
-			VK_FORMAT_B8G8R8A8_SRGB,
-			image_format,
-		};
+			mutable_formats.push_back(snorm_format);
+		}
+		if (srgb_format != VK_FORMAT_UNDEFINED)
+		{
+			mutable_formats.push_back(srgb_format);
+		}
+		if (!mutable_formats.empty())
+		{
+			create_flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+			mutable_formats.push_back(image_format);
+		}
 
 		vk::viewable_image* image = nullptr;
 		if (auto found = find_cached_image(image_format,
-			::narrow<u16>(replacement.width), ::narrow<u16>(replacement.height), 1, 1,
+			::narrow<u16>(replacement_width), ::narrow<u16>(replacement_height), 1, ::narrow<u16>(replacement_mipmaps),
 			image_type, create_flags, usage_flags, sharing_mode))
 		{
 			image = found.release();
@@ -1384,14 +1419,17 @@ namespace vk
 		else
 		{
 			VkFormatEx create_format = image_format;
-			create_format.pViewFormats = mutable_formats.data();
-			create_format.viewFormatCount = mutable_formats.size();
+			if (!mutable_formats.empty())
+			{
+				create_format.pViewFormats = mutable_formats.data();
+				create_format.viewFormatCount = mutable_formats.size();
+			}
 			image = new vk::viewable_image(*m_device,
 				m_memory_types.device_local, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
 				image_type, create_format,
-				replacement.width, replacement.height, 1, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+				replacement_width, replacement_height, 1, replacement_mipmaps, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
 				VK_IMAGE_TILING_OPTIMAL, usage_flags, create_flags,
-				VMM_ALLOCATION_POOL_TEXTURE_CACHE, rsx::RSX_FORMAT_CLASS_COLOR);
+				VMM_ALLOCATION_POOL_TEXTURE_CACHE, rsx::classify_format(replacement.gcm_format));
 		}
 
 		region.reset(rsx_range);
@@ -1404,40 +1442,52 @@ namespace vk
 		region.set_swizzled(attributes.swizzled);
 		region.set_dirty(false);
 
-		// The replacement PNG stores canonical, pre-sampler-remap RGBA. Upload it
-		// through the regular A8R8G8B8 conversion path, then retain the original
-		// texture's sampler remap when the view is requested by the caller.
 		image->native_component_map = apply_component_mapping_flags(
-			CELL_GCM_TEXTURE_A8R8G8B8, rsx::component_order::default_, rsx::default_remap_vector);
+			replacement.gcm_format, rsx::component_order::default_, rsx::default_remap_vector);
 		image->set_debug_name(fmt::format("Texture Replacement @0x%x", rsx_range.start));
 
-		std::vector<u8> argb(replacement.rgba.size());
-		for (usz i = 0; i < replacement.rgba.size(); i += 4)
+		std::vector<u8> argb;
+		if (rgba)
 		{
-			argb[i + 0] = replacement.rgba[i + 3];
-			argb[i + 1] = replacement.rgba[i + 0];
-			argb[i + 2] = replacement.rgba[i + 1];
-			argb[i + 3] = replacement.rgba[i + 2];
+			const auto& source = replacement.levels.front().data;
+			argb.resize(source.size());
+			for (usz i = 0; i < source.size(); i += 4)
+			{
+				argb[i + 0] = source[i + 3];
+				argb[i + 1] = source[i + 0];
+				argb[i + 2] = source[i + 1];
+				argb[i + 3] = source[i + 2];
+			}
 		}
 
-		rsx::subresource_layout subresource
+		std::vector<rsx::subresource_layout> subresources;
+		subresources.reserve(replacement.levels.size());
+		for (usz index = 0; index < replacement.levels.size(); ++index)
 		{
-			.data = rsx::io_buffer(argb.data(), argb.size()),
-			.width_in_texel = ::narrow<u16>(replacement.width),
-			.height_in_texel = ::narrow<u16>(replacement.height),
-			.width_in_block = ::narrow<u16>(replacement.width),
-			.height_in_block = ::narrow<u16>(replacement.height),
-			.depth = 1,
-			.level = 0,
-			.layer = 0,
-			.border = 0,
-			.reserved = 0,
-			.pitch_in_block = replacement.width,
-		};
+			const auto& level = replacement.levels[index];
+			const u32 blocks_x = rgba ? level.width : std::max<u32>(1, (level.width + 3) / 4);
+			const u32 blocks_y = rgba ? level.height : std::max<u32>(1, (level.height + 3) / 4);
+			const u64 expected_size = static_cast<u64>(blocks_x) * blocks_y * block_size;
+			const auto& data = rgba ? argb : level.data;
+			ensure(data.size() == expected_size);
+			subresources.push_back({
+				.data = rsx::io_buffer(data.data(), data.size()),
+				.width_in_texel = ::narrow<u16>(level.width),
+				.height_in_texel = ::narrow<u16>(level.height),
+				.width_in_block = ::narrow<u16>(blocks_x),
+				.height_in_block = ::narrow<u16>(blocks_y),
+				.depth = 1,
+				.level = ::narrow<u16>(index),
+				.layer = 0,
+				.border = 0,
+				.reserved = 0,
+				.pitch_in_block = blocks_x,
+			});
+		}
 
 		vk::enter_uninterruptible();
-		vk::upload_image(cmd, image, { subresource }, CELL_GCM_TEXTURE_A8R8G8B8, false, 1,
-			VK_IMAGE_ASPECT_COLOR_BIT, *m_texture_upload_heap, 4,
+		vk::upload_image(cmd, image, subresources, replacement.gcm_format, false, 1,
+			VK_IMAGE_ASPECT_COLOR_BIT, *m_texture_upload_heap, block_size,
 			initialize_image_layout | upload_contents_inline | source_is_userptr);
 		vk::leave_uninterruptible();
 

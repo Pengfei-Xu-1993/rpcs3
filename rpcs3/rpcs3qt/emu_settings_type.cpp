@@ -102,6 +102,7 @@ const std::map<emu_settings_type, cfg_location> settings_location =
 	{ emu_settings_type::TextureLodBias,             get_cfg_location(local_cfg.video.texture_lod_bias) },
 	{ emu_settings_type::DumpReplaceableTextures,    get_cfg_location(local_cfg.video.dump_replaceable_textures) },
 	{ emu_settings_type::LoadTextureReplacements,    get_cfg_location(local_cfg.video.load_texture_replacements) },
+	{ emu_settings_type::LoadNormalTextureReplacements, get_cfg_location(local_cfg.video.load_normal_texture_replacements) },
 	{ emu_settings_type::ResolutionScale,            get_cfg_location(local_cfg.video.resolution_scale_percent) },
 	{ emu_settings_type::MinimumScalableDimension,   get_cfg_location(local_cfg.video.min_scalable_dimension) },
 	{ emu_settings_type::VBlankRate,                 get_cfg_location(local_cfg.video.vblank_rate) },

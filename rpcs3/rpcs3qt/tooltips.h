@@ -216,7 +216,8 @@ public:
 
 		const QString texture_lod_bias = tr("Changes Texture sampling accuracy. (Small changes have a big effect.)\nAvoid using values outside the range of -12 to +12 if you're unsure.\n-3 to +3 is plenty for most usecases");
 		const QString dump_replaceable_textures = tr("Writes eligible static 2D game textures as PNG files under config/textures/<TITLE_ID>/dumps.\nThis can cause stutter and use significant disk space. Disable it after collecting the textures you need.");
-		const QString load_texture_replacements = tr("Loads matching PNG files from config/textures/<TITLE_ID>/replacements without modifying the game archives or guest memory budget.\nCurrently supported by the Vulkan renderer. Invalid replacements safely fall back to the original texture.");
+		const QString load_texture_replacements = tr("Loads matching PNG replacements and mounted DDS texture packs without modifying the game archives or guest memory budget.\nCurrently supported by the Vulkan renderer. Invalid replacements safely fall back to the original texture.");
+		const QString load_normal_texture_replacements = tr("Also loads texture-pack entries marked as normal maps.\nDisabled by default because incorrectly processed normal maps can create angle-dependent oil-film, raster, or lighting artifacts.");
 
 		// gui
 

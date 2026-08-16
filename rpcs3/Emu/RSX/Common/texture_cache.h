@@ -651,7 +651,7 @@ namespace rsx
 			rsx::texture_upload_context context, rsx::texture_dimension_extended type, bool swizzled, component_order swizzle_flags, rsx::flags32_t flags) = 0;
 		virtual section_storage_type* upload_image_from_cpu(commandbuffer_type&, const address_range32 &rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u32 pitch, u32 gcm_format, texture_upload_context context,
 			const std::vector<rsx::subresource_layout>& subresource_layout, rsx::texture_dimension_extended type, bool swizzled) = 0;
-		virtual section_storage_type* upload_texture_replacement_from_cpu(commandbuffer_type&, const address_range32&, const image_section_attributes_t&, const texture_replacements::image&)
+		virtual section_storage_type* upload_texture_replacement_from_cpu(commandbuffer_type&, const address_range32&, const image_section_attributes_t&, const texture_replacements::replacement_texture&)
 		{
 			return nullptr;
 		}
@@ -2672,12 +2672,13 @@ namespace rsx
 
 			const auto subresources_layout = get_subresources_layout(tex);
 			const auto format_class = classify_format(attributes.gcm_format);
-			std::optional<texture_replacements::image> replacement;
+			std::optional<texture_replacements::replacement_texture> replacement;
 
 			if constexpr (std::is_same_v<std::remove_cvref_t<RsxTextureType>, rsx::fragment_texture>)
 			{
 				const bool texture_replacement_enabled = supports_texture_replacements() && g_cfg.video.load_texture_replacements.get();
 				const bool texture_dump_enabled = g_cfg.video.dump_replaceable_textures.get();
+				const bool normal_texture_replacement_enabled = g_cfg.video.load_normal_texture_replacements.get();
 				const bool is_static_candidate = options.is_compressed_format || attributes.swizzled;
 
 				if ((texture_replacement_enabled || texture_dump_enabled) &&
@@ -2701,7 +2702,8 @@ namespace rsx
 					};
 
 					replacement = texture_replacements::process_texture(
-						descriptor, subresources_layout, texture_dump_enabled, texture_replacement_enabled);
+						descriptor, subresources_layout, texture_dump_enabled, texture_replacement_enabled,
+						normal_texture_replacement_enabled);
 				}
 			}
 

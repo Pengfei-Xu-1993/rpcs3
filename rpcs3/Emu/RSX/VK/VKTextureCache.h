@@ -484,7 +484,7 @@ namespace vk
 			rsx::texture_upload_context context, const std::vector<rsx::subresource_layout>& subresource_layout, rsx::texture_dimension_extended type, bool swizzled) override;
 
 		cached_texture_section* upload_texture_replacement_from_cpu(vk::command_buffer& cmd, const utils::address_range32& rsx_range,
-			const rsx::image_section_attributes_t& attributes, const rsx::texture_replacements::image& replacement) override;
+			const rsx::image_section_attributes_t& attributes, const rsx::texture_replacements::replacement_texture& replacement) override;
 		bool supports_texture_replacements() const override
 		{
 			return true;

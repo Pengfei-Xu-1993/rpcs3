@@ -89,6 +89,7 @@ enum class emu_settings_type
 	TextureLodBias,
 	DumpReplaceableTextures,
 	LoadTextureReplacements,
+	LoadNormalTextureReplacements,
 	ResolutionScale,
 	MinimumScalableDimension,
 	FsrSharpeningStrength,
