@@ -87,6 +87,8 @@ enum class emu_settings_type
 	ScreenSize,
 	AnisotropicFilterOverride,
 	TextureLodBias,
+	DumpReplaceableTextures,
+	LoadTextureReplacements,
 	ResolutionScale,
 	MinimumScalableDimension,
 	FsrSharpeningStrength,

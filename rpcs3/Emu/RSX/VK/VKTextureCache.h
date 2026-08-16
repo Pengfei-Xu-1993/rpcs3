@@ -483,6 +483,13 @@ namespace vk
 		cached_texture_section* upload_image_from_cpu(vk::command_buffer& cmd, const utils::address_range32& rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u32 pitch, u32 gcm_format,
 			rsx::texture_upload_context context, const std::vector<rsx::subresource_layout>& subresource_layout, rsx::texture_dimension_extended type, bool swizzled) override;
 
+		cached_texture_section* upload_texture_replacement_from_cpu(vk::command_buffer& cmd, const utils::address_range32& rsx_range,
+			const rsx::image_section_attributes_t& attributes, const rsx::texture_replacements::image& replacement) override;
+		bool supports_texture_replacements() const override
+		{
+			return true;
+		}
+
 		void set_component_order(cached_texture_section& section, u32 gcm_format, rsx::component_order expected_flags) override;
 
 		void insert_texture_barrier(vk::command_buffer& cmd, vk::image* tex, bool strong_ordering) override;

@@ -1330,6 +1330,124 @@ namespace vk
 		return section;
 	}
 
+	cached_texture_section* texture_cache::upload_texture_replacement_from_cpu(
+		vk::command_buffer& cmd,
+		const utils::address_range32& rsx_range,
+		const rsx::image_section_attributes_t& attributes,
+		const rsx::texture_replacements::image& replacement)
+	{
+		const auto& limits = m_device->gpu().get_limits();
+		if (!replacement.width || !replacement.height ||
+			replacement.width > limits.maxImageDimension2D ||
+			replacement.height > limits.maxImageDimension2D ||
+			replacement.rgba.size() != static_cast<usz>(replacement.width) * replacement.height * 4)
+		{
+			return nullptr;
+		}
+
+		const rsx::image_section_attributes_t search_desc
+		{
+			.gcm_format = attributes.gcm_format,
+			.width = attributes.width,
+			.height = attributes.height,
+			.depth = attributes.depth,
+			.mipmaps = attributes.mipmaps,
+		};
+
+		cached_texture_section& region = *find_cached_texture(rsx_range, search_desc, true, true, true);
+		ensure(!region.is_locked());
+		if (region.exists())
+		{
+			region.destroy();
+		}
+
+		constexpr VkFormat image_format = VK_FORMAT_B8G8R8A8_UNORM;
+		constexpr VkImageType image_type = VK_IMAGE_TYPE_2D;
+		constexpr VkImageUsageFlags usage_flags = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+		constexpr VkSharingMode sharing_mode = VK_SHARING_MODE_EXCLUSIVE;
+		const VkImageCreateFlags create_flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+
+		rsx::simple_array<VkFormat> mutable_formats
+		{
+			VK_FORMAT_B8G8R8A8_SNORM,
+			VK_FORMAT_B8G8R8A8_SRGB,
+			image_format,
+		};
+
+		vk::viewable_image* image = nullptr;
+		if (auto found = find_cached_image(image_format,
+			::narrow<u16>(replacement.width), ::narrow<u16>(replacement.height), 1, 1,
+			image_type, create_flags, usage_flags, sharing_mode))
+		{
+			image = found.release();
+		}
+		else
+		{
+			VkFormatEx create_format = image_format;
+			create_format.pViewFormats = mutable_formats.data();
+			create_format.viewFormatCount = mutable_formats.size();
+			image = new vk::viewable_image(*m_device,
+				m_memory_types.device_local, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+				image_type, create_format,
+				replacement.width, replacement.height, 1, 1, 1, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+				VK_IMAGE_TILING_OPTIMAL, usage_flags, create_flags,
+				VMM_ALLOCATION_POOL_TEXTURE_CACHE, rsx::RSX_FORMAT_CLASS_COLOR);
+		}
+
+		region.reset(rsx_range);
+		region.set_gcm_format(attributes.gcm_format);
+		region.set_image_type(rsx::texture_dimension_extended::texture_dimension_2d);
+		region.create(attributes.width, attributes.height, attributes.depth, attributes.mipmaps,
+			image, attributes.pitch, true, attributes.gcm_format);
+		region.set_view_flags(rsx::component_order::default_);
+		region.set_context(rsx::texture_upload_context::shader_read);
+		region.set_swizzled(attributes.swizzled);
+		region.set_dirty(false);
+
+		// The replacement PNG stores canonical, pre-sampler-remap RGBA. Upload it
+		// through the regular A8R8G8B8 conversion path, then retain the original
+		// texture's sampler remap when the view is requested by the caller.
+		image->native_component_map = apply_component_mapping_flags(
+			CELL_GCM_TEXTURE_A8R8G8B8, rsx::component_order::default_, rsx::default_remap_vector);
+		image->set_debug_name(fmt::format("Texture Replacement @0x%x", rsx_range.start));
+
+		std::vector<u8> argb(replacement.rgba.size());
+		for (usz i = 0; i < replacement.rgba.size(); i += 4)
+		{
+			argb[i + 0] = replacement.rgba[i + 3];
+			argb[i + 1] = replacement.rgba[i + 0];
+			argb[i + 2] = replacement.rgba[i + 1];
+			argb[i + 3] = replacement.rgba[i + 2];
+		}
+
+		rsx::subresource_layout subresource
+		{
+			.data = rsx::io_buffer(argb.data(), argb.size()),
+			.width_in_texel = ::narrow<u16>(replacement.width),
+			.height_in_texel = ::narrow<u16>(replacement.height),
+			.width_in_block = ::narrow<u16>(replacement.width),
+			.height_in_block = ::narrow<u16>(replacement.height),
+			.depth = 1,
+			.level = 0,
+			.layer = 0,
+			.border = 0,
+			.reserved = 0,
+			.pitch_in_block = replacement.width,
+		};
+
+		vk::enter_uninterruptible();
+		vk::upload_image(cmd, image, { subresource }, CELL_GCM_TEXTURE_A8R8G8B8, false, 1,
+			VK_IMAGE_ASPECT_COLOR_BIT, *m_texture_upload_heap, 4,
+			initialize_image_layout | upload_contents_inline | source_is_userptr);
+		vk::leave_uninterruptible();
+
+		region.protect(utils::protection::ro);
+		read_only_range = region.get_min_max(read_only_range, rsx::section_bounds::locked_range);
+		region.last_write_tag = rsx::get_shared_tag();
+		update_cache_tag();
+		return &region;
+	}
+
 	void texture_cache::set_component_order(cached_texture_section& section, u32 gcm_format, rsx::component_order expected_flags)
 	{
 		if (expected_flags == section.get_view_flags())

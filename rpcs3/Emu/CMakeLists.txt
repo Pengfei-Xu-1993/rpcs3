@@ -492,6 +492,7 @@ target_sources(rpcs3_emu PRIVATE
     RSX/Common/TextureUtils.cpp
     RSX/Common/texture_cache.cpp
     RSX/Common/texture_cache_types.cpp
+    RSX/Common/texture_replacements.cpp
     RSX/Core/RSXContext.cpp
     RSX/Core/RSXDisplay.cpp
     RSX/Core/RSXDrawCommands.cpp

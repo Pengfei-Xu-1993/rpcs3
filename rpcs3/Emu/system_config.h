@@ -166,6 +166,8 @@ struct cfg_root : cfg::node
 		cfg::uint<25, 800> resolution_scale_percent{ this, "Resolution Scale", 100, true };
 		cfg::uint<0, 16> anisotropic_level_override{ this, "Anisotropic Filter Override", 0, true };
 		cfg::_float<-32, 32> texture_lod_bias{ this, "Texture LOD Bias Addend", 0, true };
+		cfg::_bool dump_replaceable_textures{ this, "Dump Replaceable Textures", false, true };
+		cfg::_bool load_texture_replacements{ this, "Load Texture Replacements", false, true };
 		cfg::uint<1, 1024> min_scalable_dimension{ this, "Minimum Scalable Dimension", 16, true };
 		cfg::_int<0, 16> shader_compiler_threads_count{ this, "Shader Compiler Threads", 0 };
 		cfg::_int<0, 30000000> driver_recovery_timeout{ this, "Driver Recovery Timeout", 1000000, true };

@@ -6,6 +6,7 @@
 #include "texture_cache_utils.h"
 #include "texture_cache_predictor.h"
 #include "texture_cache_helpers.h"
+#include "texture_replacements.h"
 
 #include <unordered_map>
 
@@ -650,6 +651,14 @@ namespace rsx
 			rsx::texture_upload_context context, rsx::texture_dimension_extended type, bool swizzled, component_order swizzle_flags, rsx::flags32_t flags) = 0;
 		virtual section_storage_type* upload_image_from_cpu(commandbuffer_type&, const address_range32 &rsx_range, u16 width, u16 height, u16 depth, u16 mipmaps, u32 pitch, u32 gcm_format, texture_upload_context context,
 			const std::vector<rsx::subresource_layout>& subresource_layout, rsx::texture_dimension_extended type, bool swizzled) = 0;
+		virtual section_storage_type* upload_texture_replacement_from_cpu(commandbuffer_type&, const address_range32&, const image_section_attributes_t&, const texture_replacements::image&)
+		{
+			return nullptr;
+		}
+		virtual bool supports_texture_replacements() const
+		{
+			return false;
+		}
 		virtual section_storage_type* create_nul_section(commandbuffer_type&, const address_range32 &rsx_range, const image_section_attributes_t& attrs, const GCM_tile_reference& tile, bool memory_load) = 0;
 		virtual void set_component_order(section_storage_type& section, u32 gcm_format, component_order expected) = 0;
 		virtual void insert_texture_barrier(commandbuffer_type&, image_storage_type* tex, bool strong_ordering = true) = 0;
@@ -2663,6 +2672,38 @@ namespace rsx
 
 			const auto subresources_layout = get_subresources_layout(tex);
 			const auto format_class = classify_format(attributes.gcm_format);
+			std::optional<texture_replacements::image> replacement;
+
+			if constexpr (std::is_same_v<std::remove_cvref_t<RsxTextureType>, rsx::fragment_texture>)
+			{
+				const bool texture_replacement_enabled = supports_texture_replacements() && g_cfg.video.load_texture_replacements.get();
+				const bool texture_dump_enabled = g_cfg.video.dump_replaceable_textures.get();
+				const bool is_static_candidate = options.is_compressed_format || attributes.swizzled;
+
+				if ((texture_replacement_enabled || texture_dump_enabled) &&
+					is_static_candidate &&
+					extended_dimension == rsx::texture_dimension_extended::texture_dimension_2d &&
+					attributes.depth == 1 && tex.border_type() &&
+					texture_replacements::is_supported_format(attributes.gcm_format))
+				{
+					const auto format = tex.format_ex();
+					const texture_replacements::texture_descriptor descriptor
+					{
+						.gcm_format = attributes.gcm_format,
+						.format_bits = format.format_bits,
+						.format_features = format.features,
+						.texel_remap_control = format.texel_remap_control,
+						.encoded_remap = tex.decoded_remap().encoded,
+						.width = attributes.width,
+						.height = attributes.height,
+						.mipmaps = attributes.mipmaps,
+						.swizzled = attributes.swizzled,
+					};
+
+					replacement = texture_replacements::process_texture(
+						descriptor, subresources_layout, texture_dump_enabled, texture_replacement_enabled);
+				}
+			}
 
 			if (!tex_size)
 			{
@@ -2675,9 +2716,18 @@ namespace rsx
 			const address_range32 tex_range = address_range32::start_length(attributes.address, tex_size);
 			invalidate_range_impl_base(cmd, tex_range, invalidation_cause::read, {}, std::forward<Args>(extras)...);
 
-			// Upload from CPU. Note that sRGB conversion is handled in the FS
-			auto uploaded = upload_image_from_cpu(cmd, tex_range, attributes.width, attributes.height, attributes.depth, tex.get_exact_mipmap_count(), attributes.pitch, attributes.gcm_format,
-				texture_upload_context::shader_read, subresources_layout, extended_dimension, attributes.swizzled);
+			// Upload from CPU. Note that sRGB conversion is handled in the FS.
+			// External replacements preserve the guest cache range and metadata;
+			// an invalid or unsupported replacement always falls back to the guest texture.
+			auto uploaded = replacement
+				? upload_texture_replacement_from_cpu(cmd, tex_range, attributes, *replacement)
+				: nullptr;
+
+			if (!uploaded)
+			{
+				uploaded = upload_image_from_cpu(cmd, tex_range, attributes.width, attributes.height, attributes.depth, tex.get_exact_mipmap_count(), attributes.pitch, attributes.gcm_format,
+					texture_upload_context::shader_read, subresources_layout, extended_dimension, attributes.swizzled);
+			}
 
 			return{ uploaded->get_view(tex.decoded_remap()),
 					texture_upload_context::shader_read, format_class, scale, extended_dimension };
