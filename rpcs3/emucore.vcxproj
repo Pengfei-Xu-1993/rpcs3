@@ -493,6 +493,7 @@
     <ClCompile Include="Emu\RSX\Program\GLSLCommon.cpp" />
     <ClCompile Include="Emu\RSX\Common\surface_store.cpp" />
     <ClCompile Include="Emu\RSX\Common\TextureUtils.cpp" />
+    <ClCompile Include="Emu\RSX\Common\texture_replacements.cpp" />
     <ClCompile Include="Emu\RSX\Program\VertexProgramDecompiler.cpp" />
     <ClCompile Include="Emu\RSX\gcm_printing.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
@@ -1017,6 +1018,7 @@
     <ClInclude Include="Emu\RSX\Program\GLSLCommon.h" />
     <ClInclude Include="Emu\RSX\Common\surface_utils.h" />
     <ClInclude Include="Emu\RSX\Common\texture_cache.h" />
+    <ClInclude Include="Emu\RSX\Common\texture_replacements.h" />
     <ClInclude Include="Emu\RSX\Common\texture_cache_checker.h" />
     <ClInclude Include="Emu\RSX\Common\texture_cache_predictor.h" />
     <ClInclude Include="Emu\RSX\Common\texture_cache_utils.h" />

@@ -997,6 +997,20 @@
                    </widget>
                   </item>
                   <item>
+                   <widget class="QCheckBox" name="dumpTextureReplacements">
+                    <property name="text">
+                     <string>Dump Replaceable Textures</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
+                   <widget class="QCheckBox" name="loadTextureReplacements">
+                    <property name="text">
+                     <string>Load Texture Replacements</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
                    <spacer name="additional_settings_spacer">
                     <property name="orientation">
                      <enum>Qt::Orientation::Vertical</enum>
