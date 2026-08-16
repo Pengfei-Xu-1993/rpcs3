@@ -168,6 +168,7 @@ struct cfg_root : cfg::node
 		cfg::_float<-32, 32> texture_lod_bias{ this, "Texture LOD Bias Addend", 0, true };
 		cfg::_bool dump_replaceable_textures{ this, "Dump Replaceable Textures", false, true };
 		cfg::_bool load_texture_replacements{ this, "Load Texture Replacements", false, true };
+		cfg::_bool load_normal_texture_replacements{ this, "Load Normal Texture Replacements", false, true };
 		cfg::uint<1, 1024> min_scalable_dimension{ this, "Minimum Scalable Dimension", 16, true };
 		cfg::_int<0, 16> shader_compiler_threads_count{ this, "Shader Compiler Threads", 0 };
 		cfg::_int<0, 30000000> driver_recovery_timeout{ this, "Driver Recovery Timeout", 1000000, true };

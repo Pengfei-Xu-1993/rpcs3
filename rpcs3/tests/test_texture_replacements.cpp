@@ -4,6 +4,44 @@
 
 namespace rsx::texture_replacements
 {
+	namespace
+	{
+		void write_le32(std::vector<u8>& output, usz offset, u32 value)
+		{
+			output[offset + 0] = static_cast<u8>(value);
+			output[offset + 1] = static_cast<u8>(value >> 8);
+			output[offset + 2] = static_cast<u8>(value >> 16);
+			output[offset + 3] = static_cast<u8>(value >> 24);
+		}
+
+		std::vector<u8> make_dxt1_dds(u32 width, u32 height, u32 mipmaps)
+		{
+			usz payload_size = 0;
+			for (u32 level = 0; level < mipmaps; ++level)
+			{
+				const u32 level_width = std::max<u32>(1, width >> level);
+				const u32 level_height = std::max<u32>(1, height >> level);
+				payload_size += std::max<u32>(1, (level_width + 3) / 4) *
+					std::max<u32>(1, (level_height + 3) / 4) * 8;
+			}
+
+			std::vector<u8> result(128 + payload_size);
+			write_le32(result, 0, 0x20534444);
+			write_le32(result, 4, 124);
+			write_le32(result, 12, height);
+			write_le32(result, 16, width);
+			write_le32(result, 28, mipmaps);
+			write_le32(result, 76, 32);
+			write_le32(result, 80, 4);
+			write_le32(result, 84, 0x31545844);
+			for (usz index = 128; index < result.size(); ++index)
+			{
+				result[index] = static_cast<u8>(index * 29);
+			}
+			return result;
+		}
+	} // namespace
+
 	TEST(TextureReplacements, ValidatesIntegerUpscale)
 	{
 		EXPECT_TRUE(is_valid_replacement_size(256, 128, 256, 128));
@@ -141,5 +179,116 @@ namespace rsx::texture_replacements
 			EXPECT_EQ(decoded->front().rgba[i + 2], 0x00);
 			EXPECT_EQ(decoded->front().rgba[i + 3], 0xff);
 		}
+	}
+
+	TEST(TextureReplacements, DdsAndGuestBlocksProduceSameContentKey)
+	{
+		const std::vector<u8> dds = make_dxt1_dds(8, 4, 2);
+		const auto parsed = parse_dds(dds);
+		ASSERT_TRUE(parsed);
+		ASSERT_EQ(parsed->encoding, replacement_encoding::bc1);
+		ASSERT_EQ(parsed->gcm_format, CELL_GCM_TEXTURE_COMPRESSED_DXT1);
+		ASSERT_EQ(parsed->levels.size(), 2);
+		EXPECT_EQ(parsed->levels[0].data.size(), 16);
+		EXPECT_EQ(parsed->levels[1].data.size(), 8);
+
+		const rsx::subresource_layout base{
+			.data = rsx::io_buffer(dds.data() + 128, 16),
+			.width_in_texel = 8,
+			.height_in_texel = 4,
+			.width_in_block = 2,
+			.height_in_block = 1,
+			.depth = 1,
+			.level = 0,
+			.layer = 0,
+			.pitch_in_block = 2,
+		};
+		const rsx::subresource_layout mip{
+			.data = rsx::io_buffer(dds.data() + 144, 8),
+			.width_in_texel = 4,
+			.height_in_texel = 2,
+			.width_in_block = 1,
+			.height_in_block = 1,
+			.depth = 1,
+			.level = 1,
+			.layer = 0,
+			.pitch_in_block = 1,
+		};
+
+		const auto canonical = canonicalize_compressed_texture(
+			CELL_GCM_TEXTURE_COMPRESSED_DXT1, false, {base, mip});
+		ASSERT_TRUE(canonical);
+		EXPECT_EQ(canonical->levels[0].data, parsed->levels[0].data);
+		EXPECT_EQ(canonical->levels[1].data, parsed->levels[1].data);
+		EXPECT_EQ(make_compressed_key(*canonical), make_compressed_key(*parsed));
+		EXPECT_EQ(make_compressed_key(*parsed), "4907125e991f57cf5e5d8615fb37c54c38d5cdb7");
+	}
+
+	TEST(TextureReplacements, CompressedIdentityStripsGuestRowPadding)
+	{
+		std::array<u8, 32> guest{};
+		for (u32 index = 0; index < guest.size(); ++index)
+		{
+			guest[index] = static_cast<u8>(index);
+		}
+
+		const rsx::subresource_layout layout{
+			.data = rsx::io_buffer(guest.data(), guest.size()),
+			.width_in_texel = 4,
+			.height_in_texel = 8,
+			.width_in_block = 1,
+			.height_in_block = 2,
+			.depth = 1,
+			.level = 0,
+			.layer = 0,
+			.pitch_in_block = 2,
+		};
+		const auto canonical = canonicalize_compressed_texture(
+			CELL_GCM_TEXTURE_COMPRESSED_DXT1, false, {layout});
+		ASSERT_TRUE(canonical);
+		const std::vector<u8> expected{
+			0, 1, 2, 3, 4, 5, 6, 7,
+			16, 17, 18, 19, 20, 21, 22, 23,
+		};
+		EXPECT_EQ(canonical->levels.front().data, expected);
+	}
+
+	TEST(TextureReplacements, DdsParserRejectsTrailingOrIncompatibleData)
+	{
+		auto dds = make_dxt1_dds(8, 4, 2);
+		auto parsed = parse_dds(dds);
+		ASSERT_TRUE(parsed);
+		EXPECT_TRUE(is_valid_compressed_replacement(
+			2, 1, 2, CELL_GCM_TEXTURE_COMPRESSED_DXT1, *parsed));
+		EXPECT_FALSE(is_valid_compressed_replacement(
+			2, 1, 1, CELL_GCM_TEXTURE_COMPRESSED_DXT1, *parsed));
+		EXPECT_FALSE(is_valid_compressed_replacement(
+			2, 1, 2, CELL_GCM_TEXTURE_COMPRESSED_DXT45, *parsed));
+
+		dds.push_back(0);
+		EXPECT_FALSE(parse_dds(dds));
+	}
+
+	TEST(TextureReplacements, ParsesStrictMountedPackIndex)
+	{
+		const std::string key(40, 'A');
+		const std::string valid =
+			"RPCS3_TEXTURE_PACK_V1\r\n"
+			"# generated index\r\n" + key + "\t1\treplacements/example.dds\r\n";
+		const auto parsed = parse_pack_index(valid, "C:/pack");
+		ASSERT_TRUE(parsed);
+		ASSERT_EQ(parsed->size(), 1);
+		EXPECT_EQ(parsed->front().key, std::string(40, 'a'));
+		EXPECT_EQ(parsed->front().semantic, 1);
+		EXPECT_EQ(parsed->front().path, "C:/pack/replacements/example.dds");
+		EXPECT_FALSE(is_pack_entry_enabled(parsed->front(), false));
+		EXPECT_TRUE(is_pack_entry_enabled(parsed->front(), true));
+
+		pack_entry color_entry = parsed->front();
+		color_entry.semantic = 0;
+		EXPECT_TRUE(is_pack_entry_enabled(color_entry, false));
+
+		EXPECT_FALSE(parse_pack_index("RPCS3_TEXTURE_PACK_V1\n" + key + "\t2\tbad.dds\n", "C:/pack"));
+		EXPECT_FALSE(parse_pack_index("WRONG_HEADER\n", "C:/pack"));
 	}
 } // namespace rsx::texture_replacements

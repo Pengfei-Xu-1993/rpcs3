@@ -601,6 +601,7 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 	EnhanceCheckBox(emu_settings_type::VulkanAsyncTextureUploads, ui->asyncTextureStreaming, tooltips.settings.async_texture_streaming);
 	EnhanceCheckBox(emu_settings_type::DumpReplaceableTextures, ui->dumpTextureReplacements, tooltips.settings.dump_replaceable_textures);
 	EnhanceCheckBox(emu_settings_type::LoadTextureReplacements, ui->loadTextureReplacements, tooltips.settings.load_texture_replacements);
+	EnhanceCheckBox(emu_settings_type::LoadNormalTextureReplacements, ui->loadNormalTextureReplacements, tooltips.settings.load_normal_texture_replacements);
 
 	// Radio buttons
 
@@ -831,8 +832,13 @@ settings_dialog::settings_dialog(std::shared_ptr<gui_settings> gui_settings, std
 		const bool is_vulkan = (text == r_creator->Vulkan.name);
 		ui->asyncTextureStreaming->setEnabled(is_vulkan);
 		ui->loadTextureReplacements->setEnabled(is_vulkan);
+		ui->loadNormalTextureReplacements->setEnabled(is_vulkan && ui->loadTextureReplacements->isChecked());
 		ui->vulkansched->setEnabled(is_vulkan);
 	};
+	connect(ui->loadTextureReplacements, &QCheckBox::toggled, this, [this, r_creator](bool checked)
+	{
+		ui->loadNormalTextureReplacements->setEnabled(checked && ui->renderBox->currentText() == r_creator->Vulkan.name);
+	});
 
 	const auto apply_fsr_specific_options = [this]()
 	{
