@@ -69,6 +69,31 @@ namespace rsx::texture_replacements
 		u32 semantic = 0;
 	};
 
+	struct runtime_statistics
+	{
+		u32 textures_seen = 0;
+		u32 eligible_textures = 0;
+		u32 content_scans = 0;
+		u32 canonicalized_textures = 0;
+		u32 pack_matches = 0;
+		u32 dds_loads = 0;
+		u32 upload_successes = 0;
+		u32 upload_failures = 0;
+	};
+
+	constexpr bool is_early_scan_candidate(
+		bool backend_supported,
+		bool feature_enabled,
+		bool compressed,
+		bool texture_2d,
+		bool single_layer,
+		bool borderless,
+		bool format_supported)
+	{
+		return backend_supported && feature_enabled && compressed && texture_2d &&
+			single_layer && borderless && format_supported;
+	}
+
 	bool is_supported_format(u32 gcm_format);
 	bool is_valid_replacement_size(u32 original_width, u32 original_height, u32 replacement_width, u32 replacement_height);
 
@@ -93,6 +118,9 @@ namespace rsx::texture_replacements
 	std::string make_compressed_key(const replacement_texture& texture);
 	std::optional<std::vector<pack_entry>> parse_pack_index(std::string_view contents, std::string_view index_directory);
 	bool is_pack_entry_enabled(const pack_entry& entry, bool normal_replacement_enabled);
+	void record_runtime_texture(bool eligible);
+	void record_runtime_upload(bool success);
+	runtime_statistics get_runtime_statistics();
 
 	std::string make_key(const texture_descriptor& descriptor, std::span<const image> levels);
 	std::string make_filename(const texture_descriptor& descriptor, std::string_view key);

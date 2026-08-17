@@ -8,6 +8,7 @@
 #include <png.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <condition_variable>
 #include <charconv>
@@ -23,6 +24,44 @@ namespace rsx::texture_replacements
 {
 	namespace
 	{
+		struct atomic_runtime_statistics
+		{
+			std::atomic<u32> textures_seen{0};
+			std::atomic<u32> eligible_textures{0};
+			std::atomic<u32> content_scans{0};
+			std::atomic<u32> canonicalized_textures{0};
+			std::atomic<u32> pack_matches{0};
+			std::atomic<u32> dds_loads{0};
+			std::atomic<u32> upload_successes{0};
+			std::atomic<u32> upload_failures{0};
+		};
+
+		atomic_runtime_statistics g_runtime_statistics;
+
+		runtime_statistics snapshot_runtime_statistics()
+		{
+			return {
+				.textures_seen = g_runtime_statistics.textures_seen.load(std::memory_order_relaxed),
+				.eligible_textures = g_runtime_statistics.eligible_textures.load(std::memory_order_relaxed),
+				.content_scans = g_runtime_statistics.content_scans.load(std::memory_order_relaxed),
+				.canonicalized_textures = g_runtime_statistics.canonicalized_textures.load(std::memory_order_relaxed),
+				.pack_matches = g_runtime_statistics.pack_matches.load(std::memory_order_relaxed),
+				.dds_loads = g_runtime_statistics.dds_loads.load(std::memory_order_relaxed),
+				.upload_successes = g_runtime_statistics.upload_successes.load(std::memory_order_relaxed),
+				.upload_failures = g_runtime_statistics.upload_failures.load(std::memory_order_relaxed),
+			};
+		}
+
+		void log_runtime_statistics(std::string_view reason)
+		{
+			const auto stats = snapshot_runtime_statistics();
+			texture_replacement_log.notice(
+				"Runtime %s: seen=%u eligible=%u scanned=%u canonical=%u matches=%u dds=%u uploads=%u upload_failures=%u",
+				reason, stats.textures_seen, stats.eligible_textures, stats.content_scans,
+				stats.canonicalized_textures, stats.pack_matches, stats.dds_loads,
+				stats.upload_successes, stats.upload_failures);
+		}
+
 		constexpr u32 max_scale = 8;
 		constexpr u32 max_dimension = 16384;
 		constexpr u64 max_pixels = 64ull * 1024 * 1024;
@@ -312,6 +351,10 @@ namespace rsx::texture_replacements
 				texture_replacement_log.error("Ignoring incompatible DDS replacement: %s", path);
 				return {};
 			}
+			// A pack may retain archive-only tail mips that the game does not bind.
+			// The content key has already proven that the runtime-visible prefix is
+			// the intended source texture, so discard only the unused tail here.
+			result->levels.resize(descriptor.mipmaps);
 			return result;
 		}
 
@@ -397,6 +440,44 @@ namespace rsx::texture_replacements
 			return registry;
 		}
 	} // namespace
+
+	void record_runtime_texture(bool eligible)
+	{
+		const u32 seen = g_runtime_statistics.textures_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+		const u32 eligible_count = eligible
+			? g_runtime_statistics.eligible_textures.fetch_add(1, std::memory_order_relaxed) + 1
+			: g_runtime_statistics.eligible_textures.load(std::memory_order_relaxed);
+
+		if (seen == 1)
+		{
+			log_runtime_statistics("hook-active");
+		}
+		else if (eligible_count == 1 && eligible)
+		{
+			log_runtime_statistics("first-eligible");
+		}
+		else if ((seen % 262144) == 0)
+		{
+			log_runtime_statistics("progress");
+		}
+	}
+
+	void record_runtime_upload(bool success)
+	{
+		const u32 count = success
+			? g_runtime_statistics.upload_successes.fetch_add(1, std::memory_order_relaxed) + 1
+			: g_runtime_statistics.upload_failures.fetch_add(1, std::memory_order_relaxed) + 1;
+
+		if (count == 1 || (count % 32) == 0)
+		{
+			log_runtime_statistics(success ? "upload-success" : "upload-failure");
+		}
+	}
+
+	runtime_statistics get_runtime_statistics()
+	{
+		return snapshot_runtime_statistics();
+	}
 
 	bool is_supported_format(u32 gcm_format)
 	{
@@ -628,7 +709,7 @@ namespace rsx::texture_replacements
 		const replacement_texture& replacement)
 	{
 		if (!is_compressed_format(original_gcm_format) || !original_width || !original_height || !original_mipmaps ||
-			replacement.gcm_format != original_gcm_format || replacement.levels.size() != original_mipmaps ||
+			replacement.gcm_format != original_gcm_format || replacement.levels.size() < original_mipmaps ||
 			replacement.levels.empty() || !replacement.width() || !replacement.height() ||
 			replacement.width() > max_dimension || replacement.height() > max_dimension ||
 			static_cast<u64>(replacement.width()) * replacement.height() > max_compressed_pixels ||
@@ -645,7 +726,7 @@ namespace rsx::texture_replacements
 			return false;
 		}
 
-		for (usz index = 0; index < replacement.levels.size(); ++index)
+		for (usz index = 0; index < original_mipmaps; ++index)
 		{
 			const auto& level = replacement.levels[index];
 			const u32 expected_width = std::max<u32>(1, replacement.width() >> index);
@@ -805,6 +886,8 @@ namespace rsx::texture_replacements
 		bool replacement_enabled,
 		bool normal_replacement_enabled)
 	{
+		g_runtime_statistics.content_scans.fetch_add(1, std::memory_order_relaxed);
+
 		if ((!dump_enabled && !replacement_enabled) || descriptor.width < 8 || descriptor.height < 8 ||
 			!is_valid_replacement_size(descriptor.width, descriptor.height, descriptor.width, descriptor.height))
 		{
@@ -821,11 +904,14 @@ namespace rsx::texture_replacements
 		{
 			if (auto canonical = canonicalize_compressed_texture(descriptor.gcm_format, descriptor.swizzled, subresources))
 			{
+				g_runtime_statistics.canonicalized_textures.fetch_add(1, std::memory_order_relaxed);
 				const std::string compressed_key = make_compressed_key(*canonical);
 				if (const auto entry = get_pack_registry().find(root, compressed_key, normal_replacement_enabled))
 				{
+					g_runtime_statistics.pack_matches.fetch_add(1, std::memory_order_relaxed);
 					if (auto replacement = load_dds_replacement(entry->path, descriptor))
 					{
+						g_runtime_statistics.dds_loads.fetch_add(1, std::memory_order_relaxed);
 						texture_replacement_log.notice("Loaded %dx%d DDS replacement with %u mips for %dx%d texture %s",
 							replacement->width(), replacement->height(), ::size32(replacement->levels),
 							descriptor.width, descriptor.height, compressed_key);

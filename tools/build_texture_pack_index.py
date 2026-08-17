@@ -105,11 +105,15 @@ def parse_dds(path: Path) -> DdsInfo:
     )
 
 
-def content_key(dds: DdsInfo) -> str:
+def content_key(dds: DdsInfo, mipmaps: int | None = None) -> str:
+    selected_mipmaps = dds.mipmaps if mipmaps is None else mipmaps
+    if selected_mipmaps < 1 or selected_mipmaps > dds.mipmaps:
+        raise ValueError("content-key mip count is outside the DDS mip chain")
+
     digest = hashlib.sha1()
     digest.update(HASH_DOMAIN)
-    digest.update(struct.pack("<IIII", dds.gcm_format, dds.width, dds.height, dds.mipmaps))
-    for width, height, payload in dds.levels:
+    digest.update(struct.pack("<IIII", dds.gcm_format, dds.width, dds.height, selected_mipmaps))
+    for width, height, payload in dds.levels[:selected_mipmaps]:
         digest.update(struct.pack("<III", width, height, len(payload)))
         digest.update(payload)
     return digest.hexdigest()
@@ -189,20 +193,32 @@ def build_index(bundle_path: Path) -> tuple[dict[str, IndexEntry], dict[str, int
             if scale_x != scale_y or not 1 <= scale_x <= MAX_SCALE:
                 raise ValueError(f"edited DDS scale is outside 1x-{MAX_SCALE}x: {edit_path}")
 
-            key = content_key(source)
             candidate = IndexEntry(semantic, edit.file_sha256, edit_path.resolve())
-            previous = entries.get(key)
-            if previous:
-                if previous.edit_sha256 != candidate.edit_sha256:
-                    raise ValueError(f"one source texture maps to multiple edited DDS payloads: {source_path}")
-                entries[key] = IndexEntry(
-                    max(previous.semantic, candidate.semantic),
-                    previous.edit_sha256,
-                    previous.edit_path,
-                )
+            full_key = content_key(source)
+            source_keys = [full_key]
+            # Ascension stores one more tiny tail mip in its archive DDS than
+            # it exposes in the RSX texture descriptor. Index both identities
+            # so the mounted pack follows the runtime view without rewriting
+            # the source project or relying on names/addresses.
+            if source.mipmaps > 1:
+                source_keys.append(content_key(source, source.mipmaps - 1))
+
+            duplicate = full_key in entries
+            for key in source_keys:
+                previous = entries.get(key)
+                if previous:
+                    if previous.edit_sha256 != candidate.edit_sha256:
+                        raise ValueError(f"one runtime texture identity maps to multiple edited DDS payloads: {source_path}")
+                    entries[key] = IndexEntry(
+                        max(previous.semantic, candidate.semantic),
+                        previous.edit_sha256,
+                        previous.edit_path,
+                    )
+                else:
+                    entries[key] = candidate
+
+            if duplicate:
                 stats["duplicates"] += 1
-            else:
-                entries[key] = candidate
 
             stats["occurrences"] += 1
             stats["normal_occurrences" if semantic == 1 else "color_occurrences"] += 1

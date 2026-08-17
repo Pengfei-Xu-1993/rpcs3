@@ -2771,8 +2771,111 @@ namespace rsx
 				extended_dimension = std::max(extended_dimension, rsx::texture_dimension_extended::texture_dimension_2d);
 			}
 
+			const auto format_class = classify_format(attributes.gcm_format);
+			std::vector<rsx::subresource_layout> subresources_layout;
+			std::optional<texture_replacements::replacement_texture> replacement;
+			texture_replacements::texture_descriptor replacement_descriptor{};
+			bool replacement_scan_attempted = false;
+			bool replacement_feature_requested = false;
+			bool texture_replacement_enabled = false;
+			bool texture_dump_enabled = false;
+			bool normal_texture_replacement_enabled = false;
+
+			auto ensure_subresources_layout = [&]() -> const std::vector<rsx::subresource_layout>&
+			{
+				if (subresources_layout.empty())
+				{
+					subresources_layout = get_subresources_layout(tex);
+				}
+				return subresources_layout;
+			};
+
+			if constexpr (std::is_same_v<std::remove_cvref_t<RsxTextureType>, rsx::fragment_texture>)
+			{
+				texture_replacement_enabled = supports_texture_replacements() && g_cfg.video.load_texture_replacements.get();
+				texture_dump_enabled = g_cfg.video.dump_replaceable_textures.get();
+				normal_texture_replacement_enabled = g_cfg.video.load_normal_texture_replacements.get();
+				replacement_feature_requested = texture_replacement_enabled || texture_dump_enabled;
+
+				const bool early_candidate = texture_replacements::is_early_scan_candidate(
+					supports_texture_replacements(), replacement_feature_requested, options.is_compressed_format,
+					extended_dimension == rsx::texture_dimension_extended::texture_dimension_2d,
+					attributes.depth == 1, tex.border_type(),
+					texture_replacements::is_supported_format(attributes.gcm_format));
+				if (replacement_feature_requested)
+				{
+					texture_replacements::record_runtime_texture(early_candidate);
+				}
+
+				if (early_candidate)
+				{
+					bool already_checked = false;
+					{
+						reader_lock precheck_lock(m_cache_mutex);
+						if (auto cached = find_texture_from_dimensions(
+							attributes.address, attributes.gcm_format, attributes.width, attributes.height, attributes.depth))
+						{
+							already_checked = cached->was_texture_replacement_checked();
+						}
+					}
+
+					if (!already_checked)
+					{
+						const auto format = tex.format_ex();
+						replacement_descriptor = {
+							.gcm_format = attributes.gcm_format,
+							.format_bits = format.format_bits,
+							.format_features = format.features,
+							.texel_remap_control = format.texel_remap_control,
+							.encoded_remap = tex.decoded_remap().encoded,
+							.width = attributes.width,
+							.height = attributes.height,
+							.mipmaps = attributes.mipmaps,
+							.swizzled = attributes.swizzled,
+						};
+						replacement_scan_attempted = true;
+						replacement = texture_replacements::process_texture(
+							replacement_descriptor, ensure_subresources_layout(), texture_dump_enabled,
+							texture_replacement_enabled, normal_texture_replacement_enabled);
+					}
+				}
+			}
+
 			const auto lookup_range = utils::address_range32::start_length(attributes.address, attributes.pitch * required_surface_height);
 			reader_lock lock(m_cache_mutex);
+
+			if (replacement_scan_attempted)
+			{
+				lock.upgrade();
+				if (replacement)
+				{
+					if (!tex_size)
+					{
+						tex_size = static_cast<u32>(get_texture_size(tex));
+					}
+
+					const address_range32 tex_range = address_range32::start_length(attributes.address, tex_size);
+					invalidate_range_impl_base(cmd, tex_range, invalidation_cause::read, {}, std::forward<Args>(extras)...);
+					if (auto uploaded = upload_texture_replacement_from_cpu(cmd, tex_range, attributes, *replacement))
+					{
+						uploaded->set_texture_replacement_state(true, true);
+						texture_replacements::record_runtime_upload(true);
+						return { uploaded->get_view(tex.decoded_remap()), texture_upload_context::shader_read,
+							format_class, scale, extended_dimension };
+					}
+
+					texture_replacements::record_runtime_upload(false);
+					replacement.reset();
+				}
+				else if (auto cached = find_texture_from_dimensions(
+					attributes.address, attributes.gcm_format, attributes.width, attributes.height, attributes.depth))
+				{
+					// A dirtied replacement image must remain tagged until the guest upload
+					// path destroys it. It may have different dimensions/format and is unsafe
+					// to recycle as the guest texture merely because the new content missed.
+					cached->set_texture_replacement_state(true, cached->is_texture_replacement());
+				}
+			}
 
 			auto result = fast_texture_search(cmd, attributes, scale, tex.decoded_remap(),
 				options, lookup_range, extended_dimension, m_rtts,
@@ -2910,26 +3013,20 @@ namespace rsx
 			// Do direct upload from CPU as the last resort
 			m_texture_upload_misses_this_frame++;
 
-			const auto subresources_layout = get_subresources_layout(tex);
-			const auto format_class = classify_format(attributes.gcm_format);
-			std::optional<texture_replacements::replacement_texture> replacement;
+			const auto& upload_subresources_layout = ensure_subresources_layout();
 
 			if constexpr (std::is_same_v<std::remove_cvref_t<RsxTextureType>, rsx::fragment_texture>)
 			{
-				const bool texture_replacement_enabled = supports_texture_replacements() && g_cfg.video.load_texture_replacements.get();
-				const bool texture_dump_enabled = g_cfg.video.dump_replaceable_textures.get();
-				const bool normal_texture_replacement_enabled = g_cfg.video.load_normal_texture_replacements.get();
 				const bool is_static_candidate = options.is_compressed_format || attributes.swizzled;
 
-				if ((texture_replacement_enabled || texture_dump_enabled) &&
+				if (!replacement_scan_attempted && replacement_feature_requested &&
 					is_static_candidate &&
 					extended_dimension == rsx::texture_dimension_extended::texture_dimension_2d &&
 					attributes.depth == 1 && tex.border_type() &&
 					texture_replacements::is_supported_format(attributes.gcm_format))
 				{
 					const auto format = tex.format_ex();
-					const texture_replacements::texture_descriptor descriptor
-					{
+					replacement_descriptor = {
 						.gcm_format = attributes.gcm_format,
 						.format_bits = format.format_bits,
 						.format_features = format.features,
@@ -2941,8 +3038,9 @@ namespace rsx
 						.swizzled = attributes.swizzled,
 					};
 
+					replacement_scan_attempted = true;
 					replacement = texture_replacements::process_texture(
-						descriptor, subresources_layout, texture_dump_enabled, texture_replacement_enabled,
+						replacement_descriptor, upload_subresources_layout, texture_dump_enabled, texture_replacement_enabled,
 						normal_texture_replacement_enabled);
 				}
 			}
@@ -2961,15 +3059,22 @@ namespace rsx
 			// Upload from CPU. Note that sRGB conversion is handled in the FS.
 			// External replacements preserve the guest cache range and metadata;
 			// an invalid or unsupported replacement always falls back to the guest texture.
-			auto uploaded = replacement
+			const bool replacement_upload_attempted = replacement.has_value();
+			auto uploaded = replacement_upload_attempted
 				? upload_texture_replacement_from_cpu(cmd, tex_range, attributes, *replacement)
 				: nullptr;
+			const bool replacement_upload_succeeded = uploaded != nullptr;
+			if (replacement_upload_attempted)
+			{
+				texture_replacements::record_runtime_upload(replacement_upload_succeeded);
+			}
 
 			if (!uploaded)
 			{
 				uploaded = upload_image_from_cpu(cmd, tex_range, attributes.width, attributes.height, attributes.depth, tex.get_exact_mipmap_count(), attributes.pitch, attributes.gcm_format,
-					texture_upload_context::shader_read, subresources_layout, extended_dimension, attributes.swizzled);
+					texture_upload_context::shader_read, upload_subresources_layout, extended_dimension, attributes.swizzled);
 			}
+			uploaded->set_texture_replacement_state(replacement_scan_attempted, replacement_upload_succeeded);
 
 			return
 			{

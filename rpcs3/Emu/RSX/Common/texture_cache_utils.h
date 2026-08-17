@@ -1063,6 +1063,8 @@ namespace rsx
 		bool dirty = true;
 		bool triggered_exists_callbacks = false;
 		bool triggered_unreleased_callbacks = false;
+		bool texture_replacement_checked = false;
+		bool texture_replacement_active = false;
 
 	protected:
 
@@ -1152,6 +1154,8 @@ namespace rsx
 			synchronized = false;
 			flushed = false;
 			speculatively_flushed = false;
+			texture_replacement_checked = false;
+			texture_replacement_active = false;
 
 			cache_tag = 0ull;
 			last_write_tag = 0ull;
@@ -1228,9 +1232,23 @@ namespace rsx
 		 * Dirty/Unreleased Flag
 		 */
 		inline bool is_dirty() const { return dirty; } // this section is dirty and will need to be reuploaded
+		inline bool was_texture_replacement_checked() const { return texture_replacement_checked; }
+		inline bool is_texture_replacement() const { return texture_replacement_active; }
+
+		void set_texture_replacement_state(bool checked, bool active)
+		{
+			AUDIT(!active || checked);
+			texture_replacement_checked = checked;
+			texture_replacement_active = active;
+		}
 
 		void set_dirty(bool new_dirty)
 		{
+			if (new_dirty)
+			{
+				texture_replacement_checked = false;
+			}
+
 			if (new_dirty == false && !is_locked() && context == texture_upload_context::shader_read)
 				return;
 

@@ -1052,6 +1052,13 @@ namespace vk
 		ensure(!region.is_locked());
 
 		vk::viewable_image* image = nullptr;
+		if (region.exists() && region.is_texture_replacement())
+		{
+			// The managed image can be larger and use a different host format than the guest texture.
+			// Never recycle it for a later guest-memory upload after the protected range is dirtied.
+			region.destroy();
+		}
+
 		if (region.exists())
 		{
 			image = dynamic_cast<vk::viewable_image*>(region.get_raw_texture());
@@ -1507,7 +1514,7 @@ namespace vk
 
 		vk::enter_uninterruptible();
 		vk::upload_image(cmd, image, subresources, replacement.gcm_format, false, 1,
-			VK_IMAGE_ASPECT_COLOR_BIT, *m_texture_upload_heap, block_size,
+			VK_IMAGE_ASPECT_COLOR_BIT, *m_texture_upload_heap, vk::upload_heap_align_default,
 			initialize_image_layout | upload_contents_inline | source_is_userptr);
 		vk::leave_uninterruptible();
 
