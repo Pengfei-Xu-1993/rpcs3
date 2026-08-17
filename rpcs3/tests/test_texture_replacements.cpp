@@ -260,8 +260,12 @@ namespace rsx::texture_replacements
 		ASSERT_TRUE(parsed);
 		EXPECT_TRUE(is_valid_compressed_replacement(
 			2, 1, 2, CELL_GCM_TEXTURE_COMPRESSED_DXT1, *parsed));
-		EXPECT_FALSE(is_valid_compressed_replacement(
+		// Runtime descriptors can omit archive-only tail mips. A replacement
+		// with the same visible prefix remains compatible and is trimmed at load.
+		EXPECT_TRUE(is_valid_compressed_replacement(
 			2, 1, 1, CELL_GCM_TEXTURE_COMPRESSED_DXT1, *parsed));
+		EXPECT_FALSE(is_valid_compressed_replacement(
+			2, 1, 3, CELL_GCM_TEXTURE_COMPRESSED_DXT1, *parsed));
 		EXPECT_FALSE(is_valid_compressed_replacement(
 			2, 1, 2, CELL_GCM_TEXTURE_COMPRESSED_DXT45, *parsed));
 
@@ -290,5 +294,17 @@ namespace rsx::texture_replacements
 
 		EXPECT_FALSE(parse_pack_index("RPCS3_TEXTURE_PACK_V1\n" + key + "\t2\tbad.dds\n", "C:/pack"));
 		EXPECT_FALSE(parse_pack_index("WRONG_HEADER\n", "C:/pack"));
+	}
+
+	TEST(TextureReplacements, EarlyScanRequiresStaticCompressedFragmentInputs)
+	{
+		EXPECT_TRUE(is_early_scan_candidate(true, true, true, true, true, true, true));
+		EXPECT_FALSE(is_early_scan_candidate(false, true, true, true, true, true, true));
+		EXPECT_FALSE(is_early_scan_candidate(true, false, true, true, true, true, true));
+		EXPECT_FALSE(is_early_scan_candidate(true, true, false, true, true, true, true));
+		EXPECT_FALSE(is_early_scan_candidate(true, true, true, false, true, true, true));
+		EXPECT_FALSE(is_early_scan_candidate(true, true, true, true, false, true, true));
+		EXPECT_FALSE(is_early_scan_candidate(true, true, true, true, true, false, true));
+		EXPECT_FALSE(is_early_scan_candidate(true, true, true, true, true, true, false));
 	}
 } // namespace rsx::texture_replacements
