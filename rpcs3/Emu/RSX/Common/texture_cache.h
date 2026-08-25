@@ -2861,7 +2861,7 @@ namespace rsx
 						uploaded->set_texture_replacement_state(true, true);
 						texture_replacements::record_runtime_upload(true);
 						return { uploaded->get_view(tex.decoded_remap()), texture_upload_context::shader_read,
-							format_class, scale, extended_dimension };
+							format_class, scale, extended_dimension, attributes.address };
 					}
 
 					texture_replacements::record_runtime_upload(false);

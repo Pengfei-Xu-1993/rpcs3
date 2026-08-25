@@ -1255,6 +1255,9 @@
     <ClCompile Include="Emu\RSX\Core\RSXContext.cpp">
       <Filter>Emu\GPU\RSX\Core</Filter>
     </ClCompile>
+    <ClCompile Include="Emu\RSX\Core\CharacterVertexProbe.cpp">
+      <Filter>Emu\GPU\RSX\Core</Filter>
+    </ClCompile>
     <ClCompile Include="Emu\RSX\Core\RSXDisplay.cpp">
       <Filter>Emu\GPU\RSX\Core</Filter>
     </ClCompile>
@@ -1367,6 +1370,9 @@
       <Filter>Emu\Audio</Filter>
     </ClCompile>
     <ClCompile Include="Emu\Cell\ErrorCodes.cpp">
+      <Filter>Emu\Cell</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\Cell\AscensionSpuTaskProbe.cpp">
       <Filter>Emu\Cell</Filter>
     </ClCompile>
     <ClCompile Include="util\emu_utils.cpp">
@@ -1993,6 +1999,9 @@
       <Filter>Emu\Cell\Modules</Filter>
     </ClInclude>
     <ClInclude Include="Emu\Cell\ErrorCodes.h">
+      <Filter>Emu\Cell</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\Cell\AscensionSpuTaskProbe.h">
       <Filter>Emu\Cell</Filter>
     </ClInclude>
     <ClInclude Include="Emu\Cell\PPUCallback.h">
@@ -2675,6 +2684,9 @@
       <Filter>Utilities</Filter>
     </ClInclude>
     <ClInclude Include="Emu\RSX\Core\RSXContext.h">
+      <Filter>Emu\GPU\RSX\Core</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\Core\CharacterVertexProbe.h">
       <Filter>Emu\GPU\RSX\Core</Filter>
     </ClInclude>
     <ClInclude Include="Crypto\unzip.h">

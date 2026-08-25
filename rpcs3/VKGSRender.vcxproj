@@ -12,8 +12,10 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Emu\RSX\VK\upscalers\bilinear_pass.hpp" />
+    <ClInclude Include="Emu\RSX\VK\upscalers\dlss_pass.h" />
     <ClInclude Include="Emu\RSX\VK\upscalers\fsr_pass.h" />
     <ClInclude Include="Emu\RSX\VK\upscalers\nearest_pass.hpp" />
+    <ClInclude Include="Emu\RSX\VK\upscalers\temporal_capture.h" />
     <ClInclude Include="Emu\RSX\VK\upscalers\upscaling.h" />
     <ClInclude Include="Emu\RSX\VK\VKAsyncScheduler.h" />
     <ClInclude Include="Emu\RSX\VK\VKCommandStream.h" />
@@ -72,7 +74,11 @@
     <ClInclude Include="Emu\RSX\VK\VulkanAPI.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="Emu\RSX\VK\upscalers\dlss_pass.cpp">
+      <ExcludedFromBuild Condition="'$(NvidiaDlssEnabled)'!='true'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="Emu\RSX\VK\upscalers\fsr1\fsr_pass.cpp" />
+    <ClCompile Include="Emu\RSX\VK\upscalers\temporal_capture.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKAsyncScheduler.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKCommandStream.cpp" />
     <ClCompile Include="Emu\RSX\VK\VKCommonDecompiler.cpp" />
@@ -156,10 +162,14 @@
     <Import Project="$(SolutionDir)\buildfiles\msvc\rpcs3_release.props" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <NvidiaDlssEnabled Condition="'$(NvidiaDlssSdkRoot)'!=''">true</NvidiaDlssEnabled>
+  </PropertyGroup>
   <PropertyGroup />
   <ItemDefinitionGroup>
     <ClCompile>
-      <AdditionalIncludeDirectories>$(VULKAN_SDK)\Include;$(SolutionDir)\3rdparty\glslang\glslang\Public;..\3rdparty\glslang\glslang;%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\GPUOpen\VulkanMemoryAllocator\include</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(NvidiaDlssSdkRoot)\include;$(VULKAN_SDK)\Include;$(SolutionDir)\3rdparty\glslang\glslang\Public;..\3rdparty\glslang\glslang;%(AdditionalIncludeDirectories);$(SolutionDir)3rdparty\GPUOpen\VulkanMemoryAllocator\include</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions Condition="'$(NvidiaDlssEnabled)'=='true'">RPCS3_HAS_NVIDIA_DLSS=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">/bigobj %(AdditionalOptions)</AdditionalOptions>
       <Optimization Condition="'$(Configuration)|$(Platform)'=='Release|x64'">MaxSpeed</Optimization>
     </ClCompile>

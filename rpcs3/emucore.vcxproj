@@ -75,6 +75,7 @@
       <ExcludedFromBuild>true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="Emu\cache_utils.cpp" />
+    <ClCompile Include="Emu\Cell\AscensionSpuTaskProbe.cpp" />
     <ClCompile Include="Emu\Cell\ErrorCodes.cpp" />
     <ClCompile Include="Emu\Cell\lv2\sys_game.cpp" />
     <ClCompile Include="Emu\Cell\Modules\cellMusicSelectionContext.cpp" />
@@ -123,6 +124,7 @@
     <ClCompile Include="Emu\perf_monitor.cpp" />
     <ClCompile Include="Emu\RSX\Common\texture_cache.cpp" />
     <ClCompile Include="Emu\RSX\Common\texture_cache_types.cpp" />
+    <ClCompile Include="Emu\RSX\Core\CharacterVertexProbe.cpp" />
     <ClCompile Include="Emu\RSX\Core\RSXContext.cpp" />
     <ClCompile Include="Emu\RSX\Core\RSXDisplay.cpp" />
     <ClCompile Include="Emu\RSX\Core\RSXDrawCommands.cpp" />
@@ -690,6 +692,7 @@
     <ClInclude Include="Emu\RSX\Common\surface_cache_dma.hpp" />
     <ClInclude Include="Emu\RSX\Common\time.hpp" />
     <ClInclude Include="Emu\RSX\Common\unordered_map.hpp" />
+    <ClInclude Include="Emu\RSX\Core\CharacterVertexProbe.h" />
     <ClInclude Include="Emu\RSX\Core\RSXContext.h" />
     <ClInclude Include="Emu\RSX\Core\RSXDrawCommands.h" />
     <ClInclude Include="Emu\RSX\Core\RSXDriverState.h" />
@@ -876,6 +879,7 @@
     <ClInclude Include="Emu\Audio\Null\NullAudioBackend.h" />
     <ClInclude Include="Emu\Audio\Null\null_enumerator.h" />
     <ClInclude Include="Emu\Cell\Common.h" />
+    <ClInclude Include="Emu\Cell\AscensionSpuTaskProbe.h" />
     <ClInclude Include="Emu\Cell\ErrorCodes.h" />
     <ClInclude Include="Emu\Cell\lv2\sys_cond.h" />
     <ClInclude Include="Emu\Cell\lv2\sys_dbg.h" />

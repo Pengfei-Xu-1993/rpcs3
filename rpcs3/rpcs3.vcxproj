@@ -50,6 +50,14 @@
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
+    <NvidiaDlssEnabled Condition="'$(NvidiaDlssSdkRoot)'!=''">true</NvidiaDlssEnabled>
+    <NvidiaDlssLibraryPath Condition="'$(NvidiaDlssEnabled)'=='true'">$(NvidiaDlssSdkRoot)\lib\Windows_x86_64\x64</NvidiaDlssLibraryPath>
+    <NvidiaDlssImportLibrary Condition="'$(NvidiaDlssEnabled)'=='true' and '$(Configuration)'=='Release'">nvsdk_ngx_s.lib</NvidiaDlssImportLibrary>
+    <NvidiaDlssImportLibrary Condition="'$(NvidiaDlssEnabled)'=='true' and '$(Configuration)'=='Debug'">nvsdk_ngx_d_dbg.lib</NvidiaDlssImportLibrary>
+    <NvidiaDlssRuntime Condition="'$(NvidiaDlssEnabled)'=='true' and '$(Configuration)'=='Release'">$(NvidiaDlssSdkRoot)\lib\Windows_x86_64\rel\nvngx_dlss.dll</NvidiaDlssRuntime>
+    <NvidiaDlssRuntime Condition="'$(NvidiaDlssEnabled)'=='true' and '$(Configuration)'=='Debug'">$(NvidiaDlssSdkRoot)\lib\Windows_x86_64\dev\nvngx_dlss.dll</NvidiaDlssRuntime>
+  </PropertyGroup>
+  <PropertyGroup>
     <OutDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(SolutionDir)bin\</OutDir>
     <IntDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(SolutionDir)build\tmp\$(ProjectName)-$(Configuration)-$(Platform)\</IntDir>
     <TargetName Condition="'$(Configuration)|$(Platform)'=='Release|x64'">rpcs3</TargetName>
@@ -87,8 +95,8 @@
       <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(OpenCvWorld).lib;DbgHelp.lib;Ole32.lib;gdi32.lib;hidapi.lib;libusb-1.0.lib;winmm.lib;miniupnpc_static.lib;rtmidi.lib;imm32.lib;ksuser.lib;version.lib;OpenAL32.lib;XAudio.lib;GLGSRender.lib;shlwapi.lib;VKGSRender.lib;vulkan-1.lib;wolfssl.lib;libcurl.lib;Wldap32.lib;glslang.lib;OSDependent.lib;SPIRV.lib;MachineIndependent.lib;GenericCodeGen.lib;Advapi32.lib;user32.lib;zlib.lib;zstd.lib;libpng16.lib;asmjit.lib;yaml-cpp.lib;discord-rpc.lib;emucore.lib;dxgi.lib;shell32.lib;Qt6Core.lib;Qt6Gui.lib;Qt6Widgets.lib;Qt6Concurrent.lib;Qt6Multimedia.lib;Qt6MultimediaWidgets.lib;Qt6Svg.lib;Qt6SvgWidgets.lib;7zip.lib;libcubeb.lib;cubeb.lib;soundtouch.lib;Avrt.lib;SDL.lib;fusion.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(OpenCvBuildDir)\x64\lib;$(SolutionDir)build\lib\$(Configuration)-$(Platform)\glslang;$(SolutionDir)build\lib_ext\$(CONFIGURATION)-$(PLATFORM);$(SolutionDir)build\lib\$(Configuration)-$(Platform)\protobuf_build\lib;$(QTDIR)\lib;$(VULKAN_SDK)\Lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>$(NvidiaDlssImportLibrary);$(OpenCvWorld).lib;DbgHelp.lib;Ole32.lib;gdi32.lib;hidapi.lib;libusb-1.0.lib;winmm.lib;miniupnpc_static.lib;rtmidi.lib;imm32.lib;ksuser.lib;version.lib;OpenAL32.lib;XAudio.lib;GLGSRender.lib;shlwapi.lib;VKGSRender.lib;vulkan-1.lib;wolfssl.lib;libcurl.lib;Wldap32.lib;glslang.lib;OSDependent.lib;SPIRV.lib;MachineIndependent.lib;GenericCodeGen.lib;Advapi32.lib;user32.lib;zlib.lib;zstd.lib;libpng16.lib;asmjit.lib;yaml-cpp.lib;discord-rpc.lib;emucore.lib;dxgi.lib;shell32.lib;Qt6Core.lib;Qt6Gui.lib;Qt6Widgets.lib;Qt6Concurrent.lib;Qt6Multimedia.lib;Qt6MultimediaWidgets.lib;Qt6Svg.lib;Qt6SvgWidgets.lib;7zip.lib;libcubeb.lib;cubeb.lib;soundtouch.lib;Avrt.lib;SDL.lib;fusion.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(NvidiaDlssLibraryPath);$(OpenCvBuildDir)\x64\lib;$(SolutionDir)build\lib\$(Configuration)-$(Platform)\glslang;$(SolutionDir)build\lib_ext\$(CONFIGURATION)-$(PLATFORM);$(SolutionDir)build\lib\$(Configuration)-$(Platform)\protobuf_build\lib;$(QTDIR)\lib;$(VULKAN_SDK)\Lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalOptions>"/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' publicKeyToken='6595b64144ccf1df' language='*' processorArchitecture='*'" %(AdditionalOptions)</AdditionalOptions>
       <DataExecutionPrevention>true</DataExecutionPrevention>
       <GenerateDebugInformation>Debug</GenerateDebugInformation>
@@ -147,8 +155,8 @@
       <ProgramDataBaseFileName>$(IntDir)vc$(PlatformToolsetVersion).pdb</ProgramDataBaseFileName>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>$(OpenCvWorld).lib;DbgHelp.lib;Ole32.lib;gdi32.lib;hidapi.lib;libusb-1.0.lib;winmm.lib;miniupnpc_static.lib;rtmidi.lib;imm32.lib;ksuser.lib;version.lib;OpenAL32.lib;XAudio.lib;GLGSRender.lib;shlwapi.lib;VKGSRender.lib;vulkan-1.lib;wolfssl.lib;libcurl.lib;Wldap32.lib;glslangd.lib;OSDependentd.lib;SPIRVd.lib;MachineIndependentd.lib;GenericCodeGend.lib;Advapi32.lib;user32.lib;zlib.lib;zstd.lib;libpng16.lib;asmjit.lib;yaml-cpp.lib;discord-rpc.lib;emucore.lib;dxgi.lib;shell32.lib;Qt6Cored.lib;Qt6Guid.lib;Qt6Widgetsd.lib;Qt6Concurrentd.lib;Qt6Multimediad.lib;Qt6MultimediaWidgetsd.lib;Qt6Svgd.lib;Qt6SvgWidgetsd.lib;7zip.lib;libcubeb.lib;cubeb.lib;soundtouch.lib;Avrt.lib;SDL.lib;fusion.lib;%(AdditionalDependencies)</AdditionalDependencies>
-      <AdditionalLibraryDirectories>$(OpenCvBuildDir)\x64\lib;$(SolutionDir)build\lib\$(Configuration)-$(Platform)\glslang;$(SolutionDir)build\lib\$(CONFIGURATION)-$(PLATFORM);$(SolutionDir)build\lib\$(Configuration)-$(Platform)\protobuf_build\lib;$(QTDIR)\lib;$(VULKAN_SDK)\Lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>$(NvidiaDlssImportLibrary);$(OpenCvWorld).lib;DbgHelp.lib;Ole32.lib;gdi32.lib;hidapi.lib;libusb-1.0.lib;winmm.lib;miniupnpc_static.lib;rtmidi.lib;imm32.lib;ksuser.lib;version.lib;OpenAL32.lib;XAudio.lib;GLGSRender.lib;shlwapi.lib;VKGSRender.lib;vulkan-1.lib;wolfssl.lib;libcurl.lib;Wldap32.lib;glslangd.lib;OSDependentd.lib;SPIRVd.lib;MachineIndependentd.lib;GenericCodeGend.lib;Advapi32.lib;user32.lib;zlib.lib;zstd.lib;libpng16.lib;asmjit.lib;yaml-cpp.lib;discord-rpc.lib;emucore.lib;dxgi.lib;shell32.lib;Qt6Cored.lib;Qt6Guid.lib;Qt6Widgetsd.lib;Qt6Concurrentd.lib;Qt6Multimediad.lib;Qt6MultimediaWidgetsd.lib;Qt6Svgd.lib;Qt6SvgWidgetsd.lib;7zip.lib;libcubeb.lib;cubeb.lib;soundtouch.lib;Avrt.lib;SDL.lib;fusion.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(NvidiaDlssLibraryPath);$(OpenCvBuildDir)\x64\lib;$(SolutionDir)build\lib\$(Configuration)-$(Platform)\glslang;$(SolutionDir)build\lib\$(CONFIGURATION)-$(PLATFORM);$(SolutionDir)build\lib\$(Configuration)-$(Platform)\protobuf_build\lib;$(QTDIR)\lib;$(VULKAN_SDK)\Lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalOptions>"/MANIFESTDEPENDENCY:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' publicKeyToken='6595b64144ccf1df' language='*' processorArchitecture='*'"  /VERBOSE %(AdditionalOptions)</AdditionalOptions>
       <DataExecutionPrevention>true</DataExecutionPrevention>
       <GenerateDebugInformation>Debug</GenerateDebugInformation>
@@ -2354,6 +2362,9 @@
     <Text Include="rpcs3qt\CMakeLists.txt" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="CopyNvidiaDlssRuntime" AfterTargets="Build" Condition="'$(NvidiaDlssEnabled)'=='true'">
+    <Copy SourceFiles="$(NvidiaDlssRuntime)" DestinationFiles="$(TargetDir)nvngx_dlss.dll" SkipUnchangedFiles="true" />
+  </Target>
   <ImportGroup Label="ExtensionTargets" />
   <ProjectExtensions>
     <VisualStudio>

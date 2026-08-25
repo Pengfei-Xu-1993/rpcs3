@@ -74,6 +74,12 @@
     <ClCompile Include="Emu\RSX\VK\upscalers\fsr1\fsr_pass.cpp">
       <Filter>upscalers\fsr1</Filter>
     </ClCompile>
+    <ClCompile Include="Emu\RSX\VK\upscalers\dlss_pass.cpp">
+      <Filter>upscalers</Filter>
+    </ClCompile>
+    <ClCompile Include="Emu\RSX\VK\upscalers\temporal_capture.cpp">
+      <Filter>upscalers</Filter>
+    </ClCompile>
     <ClCompile Include="Emu\RSX\VK\VKCommonPipelineLayout.cpp" />
     <ClCompile Include="Emu\RSX\VK\vkutils\instance.cpp">
       <Filter>vkutils</Filter>
@@ -176,6 +182,9 @@
     <ClInclude Include="Emu\RSX\VK\upscalers\bilinear_pass.hpp">
       <Filter>upscalers</Filter>
     </ClInclude>
+    <ClInclude Include="Emu\RSX\VK\upscalers\dlss_pass.h">
+      <Filter>upscalers</Filter>
+    </ClInclude>
     <ClInclude Include="Emu\RSX\VK\upscalers\fsr_pass.h">
       <Filter>upscalers</Filter>
     </ClInclude>
@@ -184,6 +193,9 @@
     </ClInclude>
     <ClInclude Include="Emu\RSX\VK\VKGSRenderTypes.hpp" />
     <ClInclude Include="Emu\RSX\VK\upscalers\nearest_pass.hpp">
+      <Filter>upscalers</Filter>
+    </ClInclude>
+    <ClInclude Include="Emu\RSX\VK\upscalers\temporal_capture.h">
       <Filter>upscalers</Filter>
     </ClInclude>
     <ClInclude Include="Emu\RSX\VK\vkutils\garbage_collector.h">
