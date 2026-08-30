@@ -160,7 +160,15 @@ void VKGSRender::present(vk::frame_context_t *ctx)
 
 	if (!swapchain_unavailable)
 	{
-		switch (VkResult error = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image))
+		const bool probe_enabled = perf_probe_enabled();
+		const u64 present_start = probe_enabled ? get_system_time() : 0;
+		const VkResult error = m_swapchain->present(ctx->present_wait_semaphore, ctx->present_image);
+		if (probe_enabled)
+		{
+			add_perf_probe_time(rsx::perf_probe_field::wsi_wait, get_system_time() - present_start);
+		}
+
+		switch (error)
 		{
 		case VK_SUCCESS:
 			break;
@@ -606,7 +614,20 @@ void VKGSRender::flip(const rsx::display_flip_info_t& info)
 	ensure(m_current_frame->swap_command_buffer == nullptr);
 
 	u64 timeout = m_swapchain->get_swap_image_count() <= 2? 0ull: 100000000ull;
-	while (VkResult status = m_swapchain->acquire_next_swapchain_image(m_current_frame->acquire_signal_semaphore, timeout, &m_current_frame->present_image))
+	const auto acquire_next_image = [&]()
+	{
+		const bool probe_enabled = perf_probe_enabled();
+		const u64 acquire_start = probe_enabled ? get_system_time() : 0;
+		const VkResult status = m_swapchain->acquire_next_swapchain_image(m_current_frame->acquire_signal_semaphore, timeout, &m_current_frame->present_image);
+		if (probe_enabled)
+		{
+			add_perf_probe_time(rsx::perf_probe_field::wsi_wait, get_system_time() - acquire_start);
+		}
+
+		return status;
+	};
+
+	while (VkResult status = acquire_next_image())
 	{
 		switch (status)
 		{

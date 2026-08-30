@@ -656,6 +656,7 @@ namespace rsx
 				{
 					performance_counters.FIFO_idle_timestamp = get_system_time();
 					performance_counters.state = FIFO::state::nop;
+					m_perf_probe_fifo_empty_after_nop = false;
 				}
 
 				return;
@@ -664,11 +665,30 @@ namespace rsx
 			{
 				if (performance_counters.state == FIFO::state::running)
 				{
-					performance_counters.FIFO_idle_timestamp = get_system_time();
+					const u64 idle_timestamp = get_system_time();
+					performance_counters.FIFO_idle_timestamp = idle_timestamp;
+
+					if (perf_probe_enabled()) [[unlikely]]
+					{
+						m_perf_probe_fifo_starvation_timestamp = idle_timestamp;
+					}
+					m_perf_probe_fifo_empty_after_nop = false;
+
 					performance_counters.state = FIFO::state::empty;
 				}
 				else
 				{
+					if (performance_counters.state == FIFO::state::nop && m_perf_probe) [[unlikely]]
+					{
+						// A zero-count NOP may precede PUT exhaustion without a
+						// jump-to-self. Starvation begins when EMPTY is observed,
+						// not at the earlier NOP.
+						m_perf_probe_fifo_empty_after_nop = true;
+						if (perf_probe_enabled() && !m_perf_probe_fifo_starvation_timestamp)
+						{
+							m_perf_probe_fifo_starvation_timestamp = get_system_time();
+						}
+					}
 					std::this_thread::yield();
 				}
 
@@ -699,9 +719,24 @@ namespace rsx
 					//Jump to self. Often preceded by NOP
 					if (performance_counters.state == FIFO::state::running)
 					{
-						performance_counters.FIFO_idle_timestamp = get_system_time();
+						const u64 idle_timestamp = get_system_time();
+						performance_counters.FIFO_idle_timestamp = idle_timestamp;
+
+						if (perf_probe_enabled()) [[unlikely]]
+						{
+							m_perf_probe_fifo_starvation_timestamp = idle_timestamp;
+						}
+
 						sync_point_request.release(true);
 					}
+					else if (performance_counters.state == FIFO::state::nop && perf_probe_enabled() &&
+						!m_perf_probe_fifo_starvation_timestamp) [[unlikely]]
+					{
+						// The common idle sequence is NOP followed by jump-to-self. The
+						// generic idle clock starts at NOP, but FIFO starvation begins here.
+						m_perf_probe_fifo_starvation_timestamp = get_system_time();
+					}
+					m_perf_probe_fifo_empty_after_nop = false;
 
 					performance_counters.state = FIFO::state::spinning;
 				}
@@ -770,6 +805,7 @@ namespace rsx
 			state != FIFO::state::running)
 		{
 			performance_counters.state = FIFO::state::running;
+			const u64 probe_idle_end = m_perf_probe_fifo_starvation_timestamp ? get_system_time() : 0;
 
 			// Hack: Delay FIFO wake-up according to setting
 			// NOTE: The typical spin setup is a NOP followed by a jump-to-self
@@ -781,6 +817,13 @@ namespace rsx
 
 			// Update performance counters with time spent in idle mode
 			performance_counters.idle_time += (get_system_time() - performance_counters.FIFO_idle_timestamp);
+
+			if (m_perf_probe_fifo_starvation_timestamp) [[unlikely]]
+			{
+				add_perf_probe_time(perf_probe_field::fifo_starved, probe_idle_end - m_perf_probe_fifo_starvation_timestamp);
+				m_perf_probe_fifo_starvation_timestamp = 0;
+			}
+			m_perf_probe_fifo_empty_after_nop = false;
 		}
 
 		do

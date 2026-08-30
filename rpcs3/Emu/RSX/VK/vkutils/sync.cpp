@@ -7,6 +7,7 @@
 #include "shared.h"
 
 #include "Emu/Cell/timers.hpp"
+#include "Emu/RSX/RSXThread.h"
 
 #include "util/sysinfo.hpp"
 #include "util/asm.hpp"
@@ -177,9 +178,18 @@ namespace vk
 
 	void fence::wait_flush()
 	{
+		auto* renderer = rsx::get_current_renderer();
+		const bool probe_enabled = renderer && renderer->perf_probe_enabled() && renderer->is_current_thread();
+		const u64 wait_start = probe_enabled ? get_system_time() : 0;
+
 		while (!flushed)
 		{
 			utils::pause();
+		}
+
+		if (probe_enabled)
+		{
+			renderer->add_perf_probe_time(rsx::perf_probe_field::submit_visibility_wait, get_system_time() - wait_start);
 		}
 	}
 
@@ -562,10 +572,23 @@ namespace vk
 	VkResult wait_for_fence(fence* pFence, u64 timeout)
 	{
 		pFence->wait_flush();
+		auto* renderer = rsx::get_current_renderer();
+		const bool probe_enabled = renderer && renderer->perf_probe_enabled() && renderer->is_current_thread();
+		const u64 wait_start = probe_enabled ? get_system_time() : 0;
+
+		const auto finish_wait = [&](VkResult result)
+		{
+			if (probe_enabled)
+			{
+				renderer->add_perf_probe_time(rsx::perf_probe_field::gpu_fence_wait, get_system_time() - wait_start);
+			}
+
+			return result;
+		};
 
 		if (timeout)
 		{
-			return vkWaitForFences(*g_render_device, 1, &pFence->handle, VK_FALSE, timeout * 1000ull);
+			return finish_wait(vkWaitForFences(*g_render_device, 1, &pFence->handle, VK_FALSE, timeout * 1000ull));
 		}
 		else
 		{
@@ -578,11 +601,11 @@ namespace vk
 					continue;
 				default:
 					die_with_error(status);
-					return status;
+					return finish_wait(status);
 				}
 			}
 
-			return VK_SUCCESS;
+			return finish_wait(VK_SUCCESS);
 		}
 	}
 

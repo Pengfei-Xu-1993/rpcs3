@@ -2392,6 +2392,8 @@ void VKGSRender::close_and_submit_command_buffer(
 	VkSemaphore additional_wait_semaphore,
 	VkPipelineStageFlags additional_wait_stage)
 {
+	begin_perf_probe_submit_frontend();
+
 	ensure(!m_queue_status.test_and_set(flush_queue_state::flushing));
 
 	// Host MM sync before executing anything on the GPU
@@ -2399,7 +2401,9 @@ void VKGSRender::close_and_submit_command_buffer(
 
 	// Workaround for deadlock occuring during RSX offloader fault
 	// TODO: Restructure command submission infrastructure to avoid this condition
+	begin_perf_probe_offloader_sync();
 	const bool sync_success = g_fxo->get<rsx::dma_manager>().sync();
+	end_perf_probe_offloader_sync();
 	const VkBool32 force_flush = !sync_success;
 
 	if (vk::test_status_interrupt(vk::heap_dirty))
@@ -2499,6 +2503,8 @@ void VKGSRender::close_and_submit_command_buffer(
 	m_current_command_buffer->submit(primary_submit_info, force_flush);
 
 	m_queue_status.clear(flush_queue_state::flushing);
+
+	end_perf_probe_submit_frontend();
 }
 
 void VKGSRender::prepare_rtts(rsx::framebuffer_creation_context context)
@@ -2853,10 +2859,11 @@ void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info* 
 
 		data.sync();
 
-		// Gather data
+		// Gather data. The query manager measures only actual readiness polling;
+		// cached results and loop bookkeeping are excluded.
 		for (const auto occlusion_id : data.indices)
 		{
-			query->result += m_occlusion_query_manager->get_query_result(occlusion_id);
+			query->result += m_occlusion_query_manager->get_query_result(occlusion_id, true);
 			if (query->result && !g_cfg.video.precise_zpass_count)
 			{
 				// We only need one hit unless precise zcull is requested

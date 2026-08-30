@@ -42,18 +42,18 @@ namespace rsx
 
 				return;
 			}
-			else
-			{
-				RSX(ctx)->flush_fifo();
-			}
+			RSX(ctx)->begin_perf_probe_guest_wait();
+			RSX(ctx)->flush_fifo();
 
 			u64 start = get_system_time();
 			u64 last_check_val = start;
+			bool timed_out = false;
 
 			while (sema != arg)
 			{
 				if (RSX(ctx)->test_stopped())
 				{
+					RSX(ctx)->end_perf_probe_guest_wait(false);
 					RSX(ctx)->state += cpu_flag::again;
 					return;
 				}
@@ -76,6 +76,7 @@ namespace rsx
 					{
 						// If longer than driver timeout force exit
 						rsx_log.error("nv406e::semaphore_acquire has timed out. semaphore_address=0x%X", addr);
+						timed_out = true;
 						break;
 					}
 				}
@@ -93,6 +94,7 @@ namespace rsx
 				utils::spin_on_cacheline_once(atomic_sema, sema, 100);
 			}
 
+			RSX(ctx)->end_perf_probe_guest_wait(!timed_out && sema == arg);
 			RSX(ctx)->fifo_wake_delay();
 			RSX(ctx)->performance_counters.idle_time += (get_system_time() - start);
 		}

@@ -164,19 +164,28 @@ namespace vk
 		return poke_query(query_slot_status[index], index, result_flags);
 	}
 
-	u32 query_pool_manager::get_query_result(u32 index)
+	u32 query_pool_manager::get_query_result(u32 index, bool track_zcull_wait)
 	{
 		// Check for cached result
 		auto& query_info = query_slot_status[index];
 
 		if (!query_info.ready)
 		{
+			auto* renderer = track_zcull_wait ? rsx::get_current_renderer() : nullptr;
+			const bool probe_enabled = renderer && renderer->perf_probe_enabled() && renderer->is_current_thread();
+			const u64 wait_start = probe_enabled ? get_system_time() : 0;
+
 			poke_query(query_info, index, result_flags);
 
 			while (!query_info.ready)
 			{
 				utils::pause();
 				poke_query(query_info, index, result_flags);
+			}
+
+			if (probe_enabled)
+			{
+				renderer->add_perf_probe_time(rsx::perf_probe_field::zcull_query_wait, get_system_time() - wait_start);
 			}
 		}
 

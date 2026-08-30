@@ -30,8 +30,20 @@
 #include "util/asm.hpp"
 
 #include <span>
+#include <cstdlib>
+#include <mutex>
 #include <thread>
 #include <unordered_set>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
+#else
+#include <time.h>
+#include <sys/resource.h>
+#endif
 
 class GSRender;
 
@@ -117,6 +129,280 @@ bool serialize<rsx::rsx_iomap_table>(utils::serial& ar, rsx::rsx_iomap_table& o)
 
 namespace rsx
 {
+	struct thread::perf_probe_state
+	{
+		struct record
+		{
+			u64 frame_id;
+			u64 frame_us;
+			f64 rsx_host_cpu_pct;
+			u32 draw_calls;
+			u32 submit_count;
+			u64 fifo_starved_us;
+			u64 guest_semaphore_wait_us;
+			u64 submit_frontend_us;
+			u64 submit_visibility_wait_us;
+			u64 gpu_fence_wait_us;
+			u64 offloader_sync_us;
+			u64 zcull_query_wait_us;
+			u64 wsi_wait_us;
+		};
+
+		explicit perf_probe_state(std::string path, std::string arm)
+			: output_path(std::move(path))
+			, arm_path(std::move(arm))
+		{
+			completed_frames.reserve(4096);
+		}
+
+		std::string output_path;
+		std::string arm_path;
+		std::mutex mutex;
+		std::vector<record> completed_frames;
+		std::vector<std::string> issues;
+		atomic_t<u64> next_frame_id{0};
+		u64 last_boundary_us = 0;
+		u64 last_cpu_time_ns = 0;
+		u64 records_written = 0;
+		bool output_committed = false;
+		bool output_failed = false;
+		bool cpu_time_available = false;
+		bool capture_started = false;
+		bool capture_completed = false;
+		bool finalized = false;
+
+		void add_issue(std::string issue)
+		{
+			if (std::find(issues.begin(), issues.end(), issue) == issues.end())
+			{
+				issues.emplace_back(std::move(issue));
+			}
+		}
+
+		void add_frame(const frame_statistics_t& stats)
+		{
+			completed_frames.emplace_back(record{
+				stats.perf_probe_frame_id,
+				stats.frame_us,
+				stats.rsx_host_cpu_pct,
+				stats.draw_calls,
+				stats.submit_count,
+				stats.fifo_starved_us,
+				stats.guest_semaphore_wait_us,
+				stats.submit_frontend_us,
+				stats.submit_visibility_wait_us,
+				stats.gpu_fence_wait_us,
+				stats.offloader_sync_us,
+				stats.zcull_query_wait_us,
+				stats.wsi_wait_us});
+		}
+
+		bool flush()
+		{
+			// Status publication may be retried during shutdown. Once the CSV has
+			// committed successfully, preserve it and only retry the status file.
+			if (output_committed)
+			{
+				return true;
+			}
+
+			if (output_failed)
+			{
+				return false;
+			}
+
+			std::string payload;
+			payload.reserve(completed_frames.size() * 160 + 256);
+			payload += "frame_id,frame_us,rsx_host_cpu_pct,draw_calls,submit_count,fifo_starved_us,guest_semaphore_wait_us,submit_frontend_us,submit_visibility_wait_us,gpu_fence_wait_us,offloader_sync_us,zcull_query_wait_us,wsi_wait_us\n";
+
+			for (const auto& stats : completed_frames)
+			{
+				payload += fmt::format(
+					"%llu,%llu,%0.6f,%u,%u,%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+					stats.frame_id,
+					stats.frame_us,
+					stats.rsx_host_cpu_pct,
+					stats.draw_calls,
+					stats.submit_count,
+					stats.fifo_starved_us,
+					stats.guest_semaphore_wait_us,
+					stats.submit_frontend_us,
+					stats.submit_visibility_wait_us,
+					stats.gpu_fence_wait_us,
+					stats.offloader_sync_us,
+					stats.zcull_query_wait_us,
+					stats.wsi_wait_us);
+			}
+
+			const std::string parent = fs::get_parent_dir(output_path);
+			if (!parent.empty() && !fs::create_path(parent) && fs::g_tls_error != fs::error::exist)
+			{
+				rsx_log.error("RSX performance probe failed to create output directory '%s': %s", parent, fs::g_tls_error);
+				output_failed = true;
+				return false;
+			}
+
+			fs::pending_file output(output_path);
+			if (!output.file || output.file.write(payload.data(), payload.size()) != payload.size() || !output.commit(false))
+			{
+				rsx_log.error("RSX performance probe failed to write '%s': %s", output_path, fs::g_tls_error);
+				output_failed = true;
+				return false;
+			}
+
+			records_written += completed_frames.size();
+			completed_frames.clear();
+			output_committed = true;
+			return true;
+		}
+
+		static std::string escape_json_string(std::string_view input)
+		{
+			std::string result;
+			result.reserve(input.size());
+
+			for (const unsigned char value : input)
+			{
+				switch (value)
+				{
+				case '\"': result += "\\\""; break;
+				case '\\': result += "\\\\"; break;
+				case '\b': result += "\\b"; break;
+				case '\f': result += "\\f"; break;
+				case '\n': result += "\\n"; break;
+				case '\r': result += "\\r"; break;
+				case '\t': result += "\\t"; break;
+				default:
+					if (value < 0x20)
+					{
+						result += fmt::format("\\u%04x", value);
+					}
+					else
+					{
+						result += static_cast<char>(value);
+					}
+				}
+			}
+
+			return result;
+		}
+
+		bool write_status()
+		{
+			std::string issue_list;
+
+			for (usz index = 0; index < issues.size(); ++index)
+			{
+				if (index)
+				{
+					issue_list += ", ";
+				}
+
+				issue_list += fmt::format("\"%s\"", escape_json_string(issues[index]));
+			}
+
+			const bool valid = issues.empty() && !output_failed && capture_completed;
+			const std::string payload = fmt::format(
+				"{\n  \"schemaVersion\": 1,\n  \"status\": \"%s\",\n  \"valid\": %s,\n  \"recordsWritten\": %llu,\n  \"issues\": [%s]\n}\n",
+				valid ? "complete" : "invalid",
+				valid ? "true" : "false",
+				records_written,
+				issue_list);
+			const std::string status_path = output_path + ".status.json";
+			const std::string parent = fs::get_parent_dir(status_path);
+
+			if (!parent.empty() && !fs::create_path(parent) && fs::g_tls_error != fs::error::exist)
+			{
+				rsx_log.error("RSX performance probe failed to create status directory '%s': %s", parent, fs::g_tls_error);
+				return false;
+			}
+
+			fs::pending_file output(status_path);
+			if (!output.file || output.file.write(payload.data(), payload.size()) != payload.size() || !output.commit(false))
+			{
+				rsx_log.error("RSX performance probe failed to write validity status '%s': %s", status_path, fs::g_tls_error);
+				return false;
+			}
+
+			return true;
+		}
+	};
+
+	static bool get_current_thread_cpu_time_ns(u64& result)
+	{
+#ifdef _WIN32
+		FILETIME creation_time{}, exit_time{}, kernel_time{}, user_time{};
+
+		if (!GetThreadTimes(GetCurrentThread(), &creation_time, &exit_time, &kernel_time, &user_time))
+		{
+			return false;
+		}
+
+		const u64 kernel_100ns = kernel_time.dwLowDateTime | (static_cast<u64>(kernel_time.dwHighDateTime) << 32);
+		const u64 user_100ns = user_time.dwLowDateTime | (static_cast<u64>(user_time.dwHighDateTime) << 32);
+		result = (kernel_100ns + user_100ns) * 100;
+		return true;
+#elif defined(CLOCK_THREAD_CPUTIME_ID)
+		::timespec thread_time{};
+
+		if (::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &thread_time))
+		{
+			return false;
+		}
+
+		result = static_cast<u64>(thread_time.tv_sec) * 1'000'000'000 + thread_time.tv_nsec;
+		return true;
+#elif defined(RUSAGE_THREAD)
+		::rusage usage{};
+
+		if (::getrusage(RUSAGE_THREAD, &usage))
+		{
+			return false;
+		}
+
+		result = static_cast<u64>(usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1'000'000'000 +
+			static_cast<u64>(usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) * 1'000;
+		return true;
+#else
+		result = 0;
+		return false;
+#endif
+	}
+
+	static u64& get_perf_probe_counter(frame_statistics_t& stats, perf_probe_field field)
+	{
+		switch (field)
+		{
+		case perf_probe_field::fifo_starved: return stats.fifo_starved_us;
+		case perf_probe_field::guest_semaphore_wait: return stats.guest_semaphore_wait_us;
+		case perf_probe_field::submit_frontend: return stats.submit_frontend_us;
+		case perf_probe_field::submit_visibility_wait: return stats.submit_visibility_wait_us;
+		case perf_probe_field::gpu_fence_wait: return stats.gpu_fence_wait_us;
+		case perf_probe_field::offloader_sync: return stats.offloader_sync_us;
+		case perf_probe_field::zcull_query_wait: return stats.zcull_query_wait_us;
+		case perf_probe_field::wsi_wait: return stats.wsi_wait_us;
+		}
+
+		fmt::throw_exception("Unknown RSX performance probe field");
+	}
+
+	static u64 get_perf_probe_nested_additive_time(const frame_statistics_t& stats)
+	{
+		return stats.submit_frontend_us +
+			stats.submit_visibility_wait_us +
+			stats.gpu_fence_wait_us +
+			stats.zcull_query_wait_us +
+			stats.wsi_wait_us;
+	}
+
+	static u64 get_perf_probe_submit_nested_time(const frame_statistics_t& stats)
+	{
+		return stats.submit_visibility_wait_us +
+			stats.gpu_fence_wait_us +
+			stats.zcull_query_wait_us +
+			stats.wsi_wait_us;
+	}
+
 	std::function<bool(u32 addr, bool is_writing)> g_access_violation_handler;
 
 	// TODO: Proper context manager
@@ -620,6 +906,8 @@ namespace rsx
 
 	thread::~thread()
 	{
+		finalize_perf_probe();
+
 		g_access_violation_handler = nullptr;
 	}
 
@@ -690,6 +978,21 @@ namespace rsx
 	thread::thread(utils::serial* _ar)
 		: cpu_thread(0x5555'5555)
 	{
+		const char* output = std::getenv("RPCS3_RSX_PERF_PROBE_OUTPUT");
+		const char* arm_path = std::getenv("RPCS3_RSX_PERF_PROBE_ARM_PATH");
+		const bool has_output = output && output[0];
+		const bool has_arm_path = arm_path && arm_path[0];
+
+		if (has_output != has_arm_path)
+		{
+			rsx_log.error("RSX one-run performance probe requires both RPCS3_RSX_PERF_PROBE_OUTPUT and RPCS3_RSX_PERF_PROBE_ARM_PATH; probe disabled.");
+		}
+		else if (has_output)
+		{
+			m_perf_probe = std::make_unique<perf_probe_state>(output, arm_path);
+			rsx_log.notice("RSX one-run performance probe enabled. Output: %s", output);
+		}
+
 		g_access_violation_handler = [this](u32 address, bool is_writing)
 		{
 			return on_access_violation(address, is_writing);
@@ -981,10 +1284,15 @@ namespace rsx
 		while (!rsx_thread_running || Emu.IsPausedOrReady())
 		{
 			// Execute backend-local tasks first
+			const bool fifo_probe_paused = pause_perf_probe_fifo_starvation_for_local_task(performance_counters.state);
 			do_local_task(performance_counters.state);
 
 			// Update sub-units
 			zcull_ctrl->update(this);
+			if (fifo_probe_paused)
+			{
+				resume_perf_probe_fifo_starvation_after_local_task();
+			}
 
 			if (is_stopped())
 			{
@@ -1147,6 +1455,7 @@ namespace rsx
 			if ((m_cycles_counter++ & 63) == 0 || m_eng_interrupt_mask)
 			{
 				// Execute backend-local tasks first
+				const bool fifo_probe_paused = pause_perf_probe_fifo_starvation_for_local_task(performance_counters.state);
 				do_local_task(performance_counters.state);
 
 				// Update other sub-units
@@ -1155,6 +1464,11 @@ namespace rsx
 				if (m_host_dma_ctrl)
 				{
 					m_host_dma_ctrl->update();
+				}
+
+				if (fifo_probe_paused)
+				{
+					resume_perf_probe_fifo_starvation_after_local_task();
 				}
 			}
 
@@ -1178,6 +1492,9 @@ namespace rsx
 		do_local_task(rsx::FIFO::state::lock_wait);
 
 		g_fxo->get<rsx::dma_manager>().join();
+
+		finalize_perf_probe();
+
 		g_fxo->get<vblank_thread>() = thread_state::finished;
 		state += cpu_flag::exit;
 	}
@@ -3197,6 +3514,336 @@ namespace rsx
 		while (external_interrupt_lock && (cpu_flag::ret - state));
 	}
 
+	bool thread::pause_perf_probe_fifo_starvation_for_local_task(FIFO::state state)
+	{
+		if (!m_perf_probe)
+		{
+			return false;
+		}
+
+		auto& probe = *m_perf_probe;
+		std::lock_guard lock(probe.mutex);
+		if (probe.finalized || m_perf_probe_fifo_local_task_paused)
+		{
+			return false;
+		}
+
+		const bool fifo_starved = state == FIFO::state::empty ||
+			state == FIFO::state::spinning ||
+			(state == FIFO::state::nop && m_perf_probe_fifo_empty_after_nop);
+		if (!fifo_starved)
+		{
+			return false;
+		}
+
+		m_perf_probe_fifo_local_task_paused = true;
+		if (m_perf_probe_armed.load() && m_perf_probe_fifo_starvation_timestamp)
+		{
+			const u64 pause_us = get_system_time();
+			m_frame_stats.fifo_starved_us += pause_us - m_perf_probe_fifo_starvation_timestamp;
+		}
+
+		m_perf_probe_fifo_starvation_timestamp = 0;
+		return true;
+	}
+
+	void thread::resume_perf_probe_fifo_starvation_after_local_task()
+	{
+		if (!m_perf_probe)
+		{
+			return;
+		}
+
+		auto& probe = *m_perf_probe;
+		std::lock_guard lock(probe.mutex);
+		if (!m_perf_probe_fifo_local_task_paused)
+		{
+			return;
+		}
+
+		m_perf_probe_fifo_local_task_paused = false;
+		const FIFO::state state = performance_counters.state;
+		const bool fifo_starved = state == FIFO::state::empty ||
+			state == FIFO::state::spinning ||
+			(state == FIFO::state::nop && m_perf_probe_fifo_empty_after_nop);
+
+		if (!probe.finalized && m_perf_probe_armed.load() && fifo_starved)
+		{
+			// Discard all local-task time, including work before/after any
+			// re-entrant frame boundary, and restart at the actual return point.
+			m_perf_probe_fifo_starvation_timestamp = get_system_time();
+		}
+		else
+		{
+			m_perf_probe_fifo_starvation_timestamp = 0;
+		}
+	}
+
+	void thread::finalize_perf_probe()
+	{
+		if (!m_perf_probe)
+		{
+			return;
+		}
+
+		auto& probe = *m_perf_probe;
+		std::lock_guard lock(probe.mutex);
+
+		if (probe.finalized)
+		{
+			return;
+		}
+
+		if (m_perf_probe_armed.load())
+		{
+			probe.add_issue("process_exit_while_armed");
+
+			if (m_perf_probe_fifo_starvation_timestamp)
+			{
+				probe.add_issue("open_fifo_interval_at_exit");
+			}
+		}
+		else if (!probe.capture_started)
+		{
+			probe.add_issue("capture_never_armed");
+		}
+
+		m_perf_probe_armed.store(false);
+		m_perf_probe_fifo_local_task_paused = false;
+
+		if (!probe.flush())
+		{
+			probe.add_issue("csv_output_failed");
+		}
+
+		probe.finalized = probe.write_status();
+	}
+
+	void thread::add_perf_probe_time_impl(perf_probe_field field, u64 elapsed_us)
+	{
+		// Remaining direct-add call sites are short RSX-thread scopes. Long scopes
+		// that can service a re-entrant flip use the boundary-aware helpers below.
+		std::lock_guard lock(m_perf_probe->mutex);
+
+		if (!m_perf_probe_armed.load())
+		{
+			return;
+		}
+
+		get_perf_probe_counter(m_frame_stats, field) += elapsed_us;
+	}
+
+	void thread::split_perf_probe_guest_wait_segment(u64 boundary_us)
+	{
+		if (!m_perf_probe_guest_wait_active || !m_perf_probe_guest_wait_timestamp)
+		{
+			return;
+		}
+
+		const u64 nested_end = get_perf_probe_nested_additive_time(m_frame_stats);
+		const u64 nested = nested_end >= m_perf_probe_guest_nested_start ?
+			nested_end - m_perf_probe_guest_nested_start : 0;
+		const u64 elapsed = boundary_us >= m_perf_probe_guest_wait_timestamp ?
+			boundary_us - m_perf_probe_guest_wait_timestamp : 0;
+		m_frame_stats.guest_semaphore_wait_us += elapsed > nested ? elapsed - nested : 0;
+		m_perf_probe_guest_wait_timestamp = boundary_us;
+		m_perf_probe_guest_nested_start = nested_end;
+	}
+
+	void thread::begin_perf_probe_guest_wait()
+	{
+		if (!m_perf_probe)
+		{
+			return;
+		}
+
+		std::lock_guard lock(m_perf_probe->mutex);
+		if (m_perf_probe_guest_wait_active)
+		{
+			if (m_perf_probe_armed.load())
+			{
+				m_perf_probe->add_issue("nested_guest_semaphore_wait");
+			}
+			return;
+		}
+
+		m_perf_probe_guest_wait_active = true;
+		if (m_perf_probe_armed.load())
+		{
+			m_perf_probe_guest_wait_timestamp = get_system_time();
+			m_perf_probe_guest_nested_start = get_perf_probe_nested_additive_time(m_frame_stats);
+		}
+	}
+
+	void thread::end_perf_probe_guest_wait(bool matched)
+	{
+		if (!m_perf_probe)
+		{
+			return;
+		}
+
+		std::lock_guard lock(m_perf_probe->mutex);
+		if (!m_perf_probe_guest_wait_active)
+		{
+			if (m_perf_probe_armed.load())
+			{
+				m_perf_probe->add_issue("guest_semaphore_wait_end_without_begin");
+			}
+			return;
+		}
+
+		if (m_perf_probe_armed.load() && m_perf_probe_guest_wait_timestamp)
+		{
+			split_perf_probe_guest_wait_segment(get_system_time());
+			if (!matched)
+			{
+				m_perf_probe->add_issue("guest_semaphore_did_not_match");
+			}
+		}
+
+		m_perf_probe_guest_wait_active = false;
+		m_perf_probe_guest_wait_timestamp = 0;
+		m_perf_probe_guest_nested_start = 0;
+	}
+
+	void thread::split_perf_probe_submit_frontend_segment(u64 boundary_us)
+	{
+		if (!m_perf_probe_submit_frontend_active || !m_perf_probe_submit_frontend_timestamp)
+		{
+			return;
+		}
+
+		const u64 nested_end = get_perf_probe_submit_nested_time(m_frame_stats);
+		const u64 nested = nested_end >= m_perf_probe_submit_frontend_nested_start ?
+			nested_end - m_perf_probe_submit_frontend_nested_start : 0;
+		const u64 elapsed = boundary_us >= m_perf_probe_submit_frontend_timestamp ?
+			boundary_us - m_perf_probe_submit_frontend_timestamp : 0;
+		m_frame_stats.submit_frontend_us += elapsed > nested ? elapsed - nested : 0;
+		m_perf_probe_submit_frontend_timestamp = boundary_us;
+		m_perf_probe_submit_frontend_nested_start = nested_end;
+	}
+
+	void thread::begin_perf_probe_submit_frontend()
+	{
+		if (!m_perf_probe)
+		{
+			return;
+		}
+
+		std::lock_guard lock(m_perf_probe->mutex);
+		if (m_perf_probe_submit_frontend_active)
+		{
+			if (m_perf_probe_armed.load())
+			{
+				m_perf_probe->add_issue("nested_submit_frontend_scope");
+			}
+			return;
+		}
+
+		m_perf_probe_submit_frontend_active = true;
+		if (m_perf_probe_armed.load())
+		{
+			m_perf_probe_submit_frontend_timestamp = get_system_time();
+			m_perf_probe_submit_frontend_nested_start = get_perf_probe_submit_nested_time(m_frame_stats);
+		}
+	}
+
+	void thread::end_perf_probe_submit_frontend()
+	{
+		if (!m_perf_probe)
+		{
+			return;
+		}
+
+		std::lock_guard lock(m_perf_probe->mutex);
+		if (!m_perf_probe_submit_frontend_active)
+		{
+			if (m_perf_probe_armed.load())
+			{
+				m_perf_probe->add_issue("submit_frontend_end_without_begin");
+			}
+			return;
+		}
+
+		if (m_perf_probe_armed.load() && m_perf_probe_submit_frontend_timestamp)
+		{
+			split_perf_probe_submit_frontend_segment(get_system_time());
+		}
+
+		m_perf_probe_submit_frontend_active = false;
+		m_perf_probe_submit_frontend_timestamp = 0;
+		m_perf_probe_submit_frontend_nested_start = 0;
+	}
+
+	void thread::split_perf_probe_offloader_sync_segment(u64 boundary_us)
+	{
+		if (!m_perf_probe_offloader_sync_active || !m_perf_probe_offloader_sync_timestamp)
+		{
+			return;
+		}
+
+		const u64 nested_end = get_perf_probe_submit_nested_time(m_frame_stats);
+		const u64 nested = nested_end >= m_perf_probe_offloader_sync_nested_start ?
+			nested_end - m_perf_probe_offloader_sync_nested_start : 0;
+		const u64 elapsed = boundary_us >= m_perf_probe_offloader_sync_timestamp ?
+			boundary_us - m_perf_probe_offloader_sync_timestamp : 0;
+		m_frame_stats.offloader_sync_us += elapsed > nested ? elapsed - nested : 0;
+		m_perf_probe_offloader_sync_timestamp = boundary_us;
+		m_perf_probe_offloader_sync_nested_start = nested_end;
+	}
+
+	void thread::begin_perf_probe_offloader_sync()
+	{
+		if (!m_perf_probe)
+		{
+			return;
+		}
+
+		std::lock_guard lock(m_perf_probe->mutex);
+		if (m_perf_probe_offloader_sync_active)
+		{
+			if (m_perf_probe_armed.load())
+			{
+				m_perf_probe->add_issue("nested_offloader_sync_scope");
+			}
+			return;
+		}
+
+		m_perf_probe_offloader_sync_active = true;
+		if (m_perf_probe_armed.load())
+		{
+			m_perf_probe_offloader_sync_timestamp = get_system_time();
+			m_perf_probe_offloader_sync_nested_start = get_perf_probe_submit_nested_time(m_frame_stats);
+		}
+	}
+
+	void thread::end_perf_probe_offloader_sync()
+	{
+		if (!m_perf_probe)
+		{
+			return;
+		}
+
+		std::lock_guard lock(m_perf_probe->mutex);
+		if (!m_perf_probe_offloader_sync_active)
+		{
+			if (m_perf_probe_armed.load())
+			{
+				m_perf_probe->add_issue("offloader_sync_end_without_begin");
+			}
+			return;
+		}
+
+		if (m_perf_probe_armed.load() && m_perf_probe_offloader_sync_timestamp)
+		{
+			split_perf_probe_offloader_sync_segment(get_system_time());
+		}
+
+		m_perf_probe_offloader_sync_active = false;
+		m_perf_probe_offloader_sync_timestamp = 0;
+		m_perf_probe_offloader_sync_nested_start = 0;
+	}
+
 	u32 thread::get_load()
 	{
 		// Average load over around 30 frames
@@ -3222,6 +3869,7 @@ namespace rsx
 	void thread::on_frame_end(u32 buffer, bool forced)
 	{
 		bool pause_emulator = false;
+		const u32 completed_draw_calls = m_frame_stats.draw_calls;
 
 		// MM sync. This is a pre-emptive operation, so we can use a deferred request.
 		rsx::mm_flush_lazy();
@@ -3276,6 +3924,9 @@ namespace rsx
 			}
 		}
 
+		const bool fifo_probe_paused_for_zcull = is_current_thread() &&
+			pause_perf_probe_fifo_starvation_for_local_task(performance_counters.state);
+
 		if (zcull_ctrl->has_pending())
 		{
 			// NOTE: This is a workaround for buggy games.
@@ -3285,8 +3936,159 @@ namespace rsx
 			zcull_ctrl->clear(this, CELL_GCM_ZPASS_PIXEL_CNT | CELL_GCM_ZCULL_STATS);
 		}
 
-		// Save current state
-		m_queued_flip.stats = m_frame_stats;
+		if (fifo_probe_paused_for_zcull)
+		{
+			resume_perf_probe_fifo_starvation_after_local_task();
+		}
+
+		if (m_perf_probe) [[unlikely]]
+		{
+			auto& probe = *m_perf_probe;
+			std::lock_guard lock(probe.mutex);
+			const bool arm_requested = !probe.finalized && fs::is_file(probe.arm_path);
+			if ((arm_requested || m_perf_probe_armed.load()) && !is_current_thread())
+			{
+				probe.add_issue("frame_boundary_not_on_rsx_thread");
+			}
+
+			// Preserve the interval that ended at this boundary for existing
+			// display/debug users, irrespective of probe state.
+			m_queued_flip.stats = m_frame_stats;
+
+			if (m_perf_probe_armed.load())
+			{
+				const u64 boundary_us = get_system_time();
+				u64 cpu_time_ns = 0;
+				const bool cpu_time_available = get_current_thread_cpu_time_ns(cpu_time_ns);
+
+				// Split an open FIFO starvation interval at the closing boundary.
+				if (m_perf_probe_fifo_starvation_timestamp)
+				{
+					m_frame_stats.fifo_starved_us += boundary_us - m_perf_probe_fifo_starvation_timestamp;
+					m_perf_probe_fifo_starvation_timestamp = boundary_us;
+				}
+				split_perf_probe_offloader_sync_segment(boundary_us);
+				split_perf_probe_submit_frontend_segment(boundary_us);
+				split_perf_probe_guest_wait_segment(boundary_us);
+
+				m_frame_stats.frame_us = boundary_us - probe.last_boundary_us;
+
+				if (m_frame_stats.frame_us && cpu_time_available && probe.cpu_time_available && cpu_time_ns >= probe.last_cpu_time_ns)
+				{
+					const u64 cpu_delta_ns = cpu_time_ns - probe.last_cpu_time_ns;
+					m_frame_stats.rsx_host_cpu_pct = std::min<f64>(100.,
+						static_cast<f64>(cpu_delta_ns) / (static_cast<f64>(m_frame_stats.frame_us) * 10.));
+				}
+				else
+				{
+					probe.add_issue("thread_cpu_time_unavailable");
+				}
+
+				probe.add_frame(m_frame_stats);
+				m_queued_flip.stats = m_frame_stats;
+				m_frame_stats = {};
+
+				if (arm_requested)
+				{
+					const u64 new_frame_id = probe.next_frame_id.fetch_add(1) + 1;
+					m_frame_stats.perf_probe_frame_id = new_frame_id;
+					probe.last_boundary_us = boundary_us;
+					probe.last_cpu_time_ns = cpu_time_ns;
+					probe.cpu_time_available = cpu_time_available;
+					if (m_perf_probe_guest_wait_active)
+					{
+						m_perf_probe_guest_wait_timestamp = boundary_us;
+						m_perf_probe_guest_nested_start = 0;
+					}
+					if (m_perf_probe_submit_frontend_active)
+					{
+						m_perf_probe_submit_frontend_timestamp = boundary_us;
+						m_perf_probe_submit_frontend_nested_start = 0;
+					}
+					if (m_perf_probe_offloader_sync_active)
+					{
+						m_perf_probe_offloader_sync_timestamp = boundary_us;
+						m_perf_probe_offloader_sync_nested_start = 0;
+					}
+				}
+				else
+				{
+					// The first boundary after disarm closes the final complete interval.
+					m_perf_probe_armed.store(false);
+					m_perf_probe_fifo_starvation_timestamp = 0;
+					m_perf_probe_fifo_empty_after_nop = false;
+					m_perf_probe_fifo_local_task_paused = false;
+					m_perf_probe_guest_wait_timestamp = 0;
+					m_perf_probe_guest_nested_start = 0;
+					m_perf_probe_submit_frontend_timestamp = 0;
+					m_perf_probe_submit_frontend_nested_start = 0;
+					m_perf_probe_offloader_sync_timestamp = 0;
+					m_perf_probe_offloader_sync_nested_start = 0;
+					probe.capture_completed = true;
+
+					if (!probe.flush())
+					{
+						probe.add_issue("csv_output_failed");
+					}
+
+					probe.finalized = probe.write_status();
+				}
+			}
+			else if (!probe.capture_started && arm_requested)
+			{
+				// Arm only at a boundary. Everything before this point is discarded;
+				// all post-boundary flip/submit/wait work enters the new interval.
+				const u64 boundary_us = get_system_time();
+				u64 cpu_time_ns = 0;
+				const bool cpu_time_available = get_current_thread_cpu_time_ns(cpu_time_ns);
+				m_frame_stats = {};
+				const u64 new_frame_id = probe.next_frame_id.fetch_add(1) + 1;
+				m_frame_stats.perf_probe_frame_id = new_frame_id;
+				probe.last_boundary_us = boundary_us;
+				probe.last_cpu_time_ns = cpu_time_ns;
+				probe.cpu_time_available = cpu_time_available;
+				probe.capture_started = true;
+				m_perf_probe_armed.store(true);
+				if (m_perf_probe_guest_wait_active)
+				{
+					m_perf_probe_guest_wait_timestamp = boundary_us;
+					m_perf_probe_guest_nested_start = 0;
+				}
+				if (m_perf_probe_submit_frontend_active)
+				{
+					m_perf_probe_submit_frontend_timestamp = boundary_us;
+					m_perf_probe_submit_frontend_nested_start = 0;
+				}
+				if (m_perf_probe_offloader_sync_active)
+				{
+					m_perf_probe_offloader_sync_timestamp = boundary_us;
+					m_perf_probe_offloader_sync_nested_start = 0;
+				}
+
+				if (!m_perf_probe_fifo_local_task_paused &&
+					(performance_counters.state == FIFO::state::empty ||
+					performance_counters.state == FIFO::state::spinning ||
+					(performance_counters.state == FIFO::state::nop && m_perf_probe_fifo_empty_after_nop)))
+				{
+					m_perf_probe_fifo_starvation_timestamp = boundary_us;
+				}
+				else
+				{
+					m_perf_probe_fifo_starvation_timestamp = 0;
+				}
+
+				if (!cpu_time_available)
+				{
+					probe.add_issue("thread_cpu_time_unavailable");
+				}
+			}
+		}
+		else
+		{
+			// Save current state
+			m_queued_flip.stats = m_frame_stats;
+		}
+
 		m_queued_flip.push(buffer);
 		m_queued_flip.skip_frame = skip_current_frame;
 
@@ -3296,7 +4098,7 @@ namespace rsx
 			{
 				// Try to enable FIFO optimizations
 				// Only rarely useful for some games like RE4
-				m_flattener.evaluate_performance(m_frame_stats.draw_calls);
+				m_flattener.evaluate_performance(completed_draw_calls);
 			}
 
 			if (g_cfg.video.frame_skip_enabled)
@@ -3329,8 +4131,12 @@ namespace rsx
 			thread_ctrl::wait_for(30'000);
 		}
 
-		// Reset current stats
-		m_frame_stats = {};
+		// In probe mode the next interval was opened at the boundary above.
+		if (!m_perf_probe || !m_perf_probe_armed.load())
+		{
+			m_frame_stats = {};
+		}
+
 		m_profiler.enabled = !!g_cfg.video.debug_overlay;
 	}
 

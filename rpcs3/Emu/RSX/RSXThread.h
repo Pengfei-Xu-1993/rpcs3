@@ -103,6 +103,8 @@ namespace rsx
 	// TODO: This class is a mess, this needs to be broken into smaller chunks, like I did for RSXFIFO and RSXZCULL (kd)
 	class thread : public cpu_thread, public GCM_context, public GRAPH_backend
 	{
+		struct perf_probe_state;
+
 		u64 timestamp_ctrl = 0;
 		u64 timestamp_subvalue = 0;
 		u64 m_cycles_counter = 0;
@@ -156,6 +158,20 @@ namespace rsx
 		// Profiler
 		rsx::profiling_timer m_profiler;
 		frame_statistics_t m_frame_stats{};
+		std::unique_ptr<perf_probe_state> m_perf_probe;
+		atomic_t<bool> m_perf_probe_armed{false};
+		u64 m_perf_probe_fifo_starvation_timestamp = 0;
+		bool m_perf_probe_fifo_empty_after_nop = false;
+		bool m_perf_probe_fifo_local_task_paused = false;
+		bool m_perf_probe_guest_wait_active = false;
+		u64 m_perf_probe_guest_wait_timestamp = 0;
+		u64 m_perf_probe_guest_nested_start = 0;
+		bool m_perf_probe_submit_frontend_active = false;
+		u64 m_perf_probe_submit_frontend_timestamp = 0;
+		u64 m_perf_probe_submit_frontend_nested_start = 0;
+		bool m_perf_probe_offloader_sync_active = false;
+		u64 m_perf_probe_offloader_sync_timestamp = 0;
+		u64 m_perf_probe_offloader_sync_nested_start = 0;
 
 		// Savestates related
 		u32 m_pause_after_x_flips = 0;
@@ -464,6 +480,35 @@ namespace rsx
 
 		// Get stats object
 		frame_statistics_t& get_stats() { return m_frame_stats; }
+
+		// One-run RSX performance probe. Simple scopes execute synchronously on the
+		// RSX thread. Guest semaphore, submit frontend, and offloader scopes are
+		// explicitly split if a local task re-enters on_frame_end.
+		bool perf_probe_enabled() const noexcept { return m_perf_probe && m_perf_probe_armed.load(); }
+		void add_perf_probe_time(perf_probe_field field, u64 elapsed_us)
+		{
+			if (m_perf_probe) [[unlikely]]
+			{
+				add_perf_probe_time_impl(field, elapsed_us);
+			}
+		}
+		void begin_perf_probe_guest_wait();
+		void end_perf_probe_guest_wait(bool matched);
+		void begin_perf_probe_submit_frontend();
+		void end_perf_probe_submit_frontend();
+		void begin_perf_probe_offloader_sync();
+		void end_perf_probe_offloader_sync();
+
+	private:
+		void add_perf_probe_time_impl(perf_probe_field field, u64 elapsed_us);
+		void split_perf_probe_guest_wait_segment(u64 boundary_us);
+		void split_perf_probe_submit_frontend_segment(u64 boundary_us);
+		void split_perf_probe_offloader_sync_segment(u64 boundary_us);
+		bool pause_perf_probe_fifo_starvation_for_local_task(FIFO::state state);
+		void resume_perf_probe_fifo_starvation_after_local_task();
+		void finalize_perf_probe();
+
+	public:
 
 		// Returns true if the current thread is the active RSX thread
 		inline bool is_current_thread() const

@@ -52,6 +52,21 @@ namespace rsx
 		u32 draw_calls;
 		u32 submit_count;
 
+		// Opt-in one-run RSX performance probe. These fields remain zero during
+		// normal execution and are exported only when RPCS3_RSX_PERF_PROBE_OUTPUT
+		// names an output CSV file.
+		u64 perf_probe_frame_id;
+		u64 frame_us;
+		f64 rsx_host_cpu_pct;
+		u64 fifo_starved_us;
+		u64 guest_semaphore_wait_us;
+		u64 submit_frontend_us;
+		u64 submit_visibility_wait_us;
+		u64 gpu_fence_wait_us;
+		u64 offloader_sync_us;
+		u64 zcull_query_wait_us;
+		u64 wsi_wait_us;
+
 		s64 setup_time;
 		s64 vertex_upload_time;
 		s64 textures_upload_time;
@@ -65,6 +80,18 @@ namespace rsx
 		u32 program_cache_lookups_ellided;
 
 		framebuffer_statistics_t framebuffer_stats;
+	};
+
+	enum class perf_probe_field : u8
+	{
+		fifo_starved,
+		guest_semaphore_wait,
+		submit_frontend,
+		submit_visibility_wait,
+		gpu_fence_wait,
+		offloader_sync,
+		zcull_query_wait,
+		wsi_wait,
 	};
 
 	struct frame_time_t
