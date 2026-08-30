@@ -79,7 +79,8 @@ namespace rsx
 				if (m_enqueued_count.load() == m_processed_count.load())
 				{
 					m_processed_count.notify_all();
-					std::this_thread::yield();
+					utils::spin_on_cacheline_once(m_work_queue.get_wait_atomic(), 0u, 1);
+					thread_ctrl::wait_on(m_work_queue);
 				}
 			}
 
