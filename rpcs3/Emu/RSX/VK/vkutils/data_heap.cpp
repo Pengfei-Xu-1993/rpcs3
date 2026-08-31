@@ -109,7 +109,7 @@ namespace vk
 		}
 
 		// Wait for DMA activity to end
-		g_fxo->get<rsx::dma_manager>().sync();
+		g_fxo->get<rsx::dma_manager>().sync(rsx::dma_manager::probe_sync_context::heap_grow);
 
 		if (mapped)
 		{

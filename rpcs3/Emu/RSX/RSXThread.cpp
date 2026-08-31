@@ -575,6 +575,12 @@ namespace rsx
 			static constexpr std::array<const char*, 9> slice_labels = {"1", "2", "3", "4", "5-8", "9-16", "17-32", "33-64", ">64"};
 			static constexpr std::array<const char*, 16> time_labels = {"<1us", "1-2us", "2-4us", "4-8us", "8-16us", "16-32us", "32-64us", "64-128us", "128-256us", "256-512us", "0.5-1ms", "1-2ms", "2-4ms", "4-8ms", "8-16ms", ">=16ms"};
 			static constexpr std::array<u32, 5> residence_us = {2, 4, 8, 16, 32};
+			static constexpr std::array<const char*, dma_manager::probe_sync_context_count> sync_context_labels = {
+				"generic", "gcmTextureHandled", "gcmTextureFallback", "gcmBackendHandled",
+				"gcmBackendFallback", "frameSubmit", "heapGrow", "waitPause", "rendererShutdown"};
+			static constexpr std::array<const char*, dma_manager::probe_gcm_label_branch_count> gcm_label_branch_labels = {
+				"unsupported", "textureLoadsCompleted", "textureMappingFallback", "backendMappingFallback",
+				"texturePrimaryCommandBuffer", "textureSecondaryCommandBuffer", "backendPrimaryCommandBuffer", "backendSecondaryCommandBuffer"};
 
 			std::string size_buckets;
 			for (usz i = 0; i < producer.size_buckets.size(); ++i)
@@ -610,14 +616,35 @@ namespace rsx
 					i ? "," : "", residence_us[i], prediction.intervals, prediction.arrivals_within_r, prediction.projected_extra_busy_us);
 			}
 
+			std::string sync_contexts;
+			u64 sync_context_call_sum = 0;
+			for (usz i = 0; i < producer.sync_by_context.size(); ++i)
+			{
+				const auto& context = producer.sync_by_context[i];
+				sync_context_call_sum += context.calls;
+				sync_contexts += fmt::format(
+					"%s{\"label\":\"%s\",\"calls\":%llu,\"fast\":%llu,\"slow\":%llu,\"slowCyclesTotal\":%llu,\"slowCyclesMax\":%llu,\"slowUsTotal\":%llu,\"slowDurationBuckets\":[%s]}",
+					i ? "," : "", sync_context_labels[i], context.calls, context.fast, context.slow,
+					context.slow_cycles_total, context.slow_cycles_max, context.slow_us_total,
+					make_histogram(context.slow_duration, time_labels));
+			}
+
+			std::string gcm_label_branches;
+			for (usz i = 0; i < producer.gcm_label_branches.size(); ++i)
+			{
+				gcm_label_branches += fmt::format("%s{\"label\":\"%s\",\"calls\":%llu}",
+					i ? "," : "", gcm_label_branch_labels[i], producer.gcm_label_branches[i]);
+			}
+
 			const std::string payload = fmt::format(
 				"{\"schemaVersion\":1,\"runtimeIdentity\":{\"probeEpoch\":%llu,\"multithreadedRsx\":%s,\"rawCopyThresholdBytes\":%u},\"captureWallUs\":%llu,"
 				"\"producer\":{\"rawCalls\":%llu,\"rawBytes\":%llu,\"rawInlineCalls\":%llu,\"rawInlineBytes\":%llu,\"rawQueuedCalls\":%llu,\"rawQueuedBytes\":%llu,\"queueWasEmpty\":%llu,"
 				"\"emptyPushByWorkerPhase\":{\"processing\":%llu,\"prepark\":%llu,\"waitIntent\":%llu},\"persistentDraws\":%llu,\"interleavedBlocks\":%llu,\"offloadEligibleBlocks\":%llu,\"offloadEligibleBytes\":%llu,\"multiEligibleDraws\":%llu,\"zeroOrOneEligibleDraws\":%llu,\"predictedBatchJobsSaved\":%llu,\"predictedBatchNotifiesSaved\":%llu,\"sizeBuckets\":[%s],\"drawBuckets\":[%s]},"
 				"\"worker\":{\"popSlices\":%llu,\"processedJobs\":%llu,\"processedRawCalls\":%llu,\"processedRawBytes\":%llu,\"drainEqualEvents\":%llu,\"spinHits\":%llu,\"waitCalls\":%llu,\"waitReturnedImmediately\":%llu,"
 				"\"jobClasses\":{\"raw\":{\"jobs\":%llu,\"bytes\":%llu},\"vector\":{\"jobs\":%llu,\"bytes\":%llu},\"index\":{\"jobs\":%llu,\"bytes\":%llu},\"callback\":{\"jobs\":%llu,\"bytes\":%llu}},\"sliceJobBuckets\":[%s],\"idleGapBuckets\":[%s],\"residencePredictions\":[%s]},"
-				"\"sync\":{\"calls\":%llu,\"fast\":%llu,\"slowRsx\":%llu,\"slowOther\":0,\"slowCyclesTotal\":%llu,\"slowCyclesMax\":%llu,\"slowDurationBuckets\":[%s]},"
-				"\"integrity\":{\"probeComplete\":%s,\"droppedOrUnattributed\":%llu,\"producerQueuedRaw\":%llu,\"workerProcessedRaw\":%llu}}\n",
+				"\"sync\":{\"calls\":%llu,\"fast\":%llu,\"slowRsx\":%llu,\"slowOther\":0,\"slowCyclesTotal\":%llu,\"slowCyclesMax\":%llu,\"slowDurationBuckets\":[%s],\"contexts\":[%s]},"
+				"\"gcmLabel\":{\"branches\":[%s],\"sameValueEarlyReturns\":%llu},"
+				"\"integrity\":{\"probeComplete\":%s,\"droppedOrUnattributed\":%llu,\"producerQueuedRaw\":%llu,\"workerProcessedRaw\":%llu,\"syncContextCalls\":%llu,\"syncContextMatches\":%s}}\n",
 				snapshot.probe_epoch, snapshot.multithreaded_rsx ? "true" : "false", snapshot.immediate_transfer_threshold, offloader_capture_wall_us,
 				producer.raw_calls, producer.raw_bytes, producer.raw_inline_calls, producer.raw_inline_bytes, producer.raw_queued_calls, producer.raw_queued_bytes, producer.queue_was_empty,
 				producer.empty_push_by_worker_phase[0], producer.empty_push_by_worker_phase[1], producer.empty_push_by_worker_phase[2], producer.persistent_draws, producer.interleaved_blocks,
@@ -625,8 +652,10 @@ namespace rsx
 				worker.pop_slices, worker.processed_jobs, worker.processed_raw_calls, worker.processed_raw_bytes, worker.drain_equal_events, worker.spin_hits, worker.wait_calls, worker.wait_returned_immediately,
 				worker.jobs_by_type[0], worker.bytes_by_type[0], worker.jobs_by_type[1], worker.bytes_by_type[1], worker.jobs_by_type[2], worker.bytes_by_type[2], worker.jobs_by_type[3], worker.bytes_by_type[3],
 				make_histogram(worker.jobs_per_slice, slice_labels), make_histogram(worker.idle_gap, time_labels), residence,
-				producer.sync_calls_rsx, producer.sync_fast_rsx, producer.sync_slow_rsx, producer.sync_slow_cycles_total, producer.sync_slow_cycles_max, make_histogram(producer.sync_slow_duration, time_labels),
-				snapshot.probe_complete ? "true" : "false", snapshot.dropped_or_unattributed, producer.raw_queued_calls, worker.processed_raw_calls);
+				producer.sync_calls_rsx, producer.sync_fast_rsx, producer.sync_slow_rsx, producer.sync_slow_cycles_total, producer.sync_slow_cycles_max, make_histogram(producer.sync_slow_duration, time_labels), sync_contexts,
+				gcm_label_branches, producer.gcm_label_same_value_early_returns,
+				snapshot.probe_complete ? "true" : "false", snapshot.dropped_or_unattributed, producer.raw_queued_calls, worker.processed_raw_calls,
+				sync_context_call_sum, sync_context_call_sum == producer.sync_calls_rsx ? "true" : "false");
 
 			const std::string raw_path = output_path + ".offloader.raw.json";
 			const std::string parent = fs::get_parent_dir(raw_path);
@@ -3909,7 +3938,7 @@ namespace rsx
 		{
 			if (g_cfg.video.multithreaded_rsx)
 			{
-				g_fxo->get<rsx::dma_manager>().sync();
+				g_fxo->get<rsx::dma_manager>().sync(dma_manager::probe_sync_context::wait_pause);
 			}
 
 			external_interrupt_ack.store(true);
