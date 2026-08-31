@@ -131,6 +131,14 @@ namespace rsx
 {
 	struct thread::perf_probe_state
 	{
+		enum class transition_state
+		{
+			idle,
+			arming,
+			disarming,
+			exiting,
+		};
+
 		struct record
 		{
 			u64 frame_id;
@@ -167,9 +175,18 @@ namespace rsx
 		bool output_committed = false;
 		bool output_failed = false;
 		bool cpu_time_available = false;
+		bool arm_attempted = false;
 		bool capture_started = false;
 		bool capture_completed = false;
 		bool finalized = false;
+		transition_state transition = transition_state::idle;
+		u64 offloader_epoch = 1;
+		u64 offloader_capture_begin_us = 0;
+		u64 offloader_capture_wall_us = 0;
+		dma_manager::probe_snapshot offloader_snapshot{};
+		bool offloader_snapshot_available = false;
+		bool offloader_output_committed = false;
+		bool offloader_output_failed = false;
 
 		void add_issue(std::string issue)
 		{
@@ -287,6 +304,115 @@ namespace rsx
 			return result;
 		}
 
+		bool write_offloader_raw()
+		{
+			if (offloader_output_committed)
+			{
+				return true;
+			}
+
+			if (offloader_output_failed)
+			{
+				return false;
+			}
+			if (!offloader_snapshot_available)
+			{
+				add_issue("offloader_snapshot_unavailable");
+				offloader_output_failed = true;
+				return false;
+			}
+			if (!offloader_capture_wall_us)
+			{
+				add_issue("offloader_capture_wall_time_invalid");
+				offloader_output_failed = true;
+				return false;
+			}
+
+			const auto& snapshot = offloader_snapshot;
+			const auto& producer = snapshot.producer;
+			const auto& worker = snapshot.worker;
+			static constexpr std::array<const char*, 15> size_labels = {"0", "1-256", "257-512", "513-1024", "1025-2048", "2049-3072", "3073-3584", "3585-4096", "4097-6144", "6145-8192", "8193-12288", "12289-16384", "16385-32768", "32769-65536", ">65536"};
+			static constexpr std::array<s64, 15> size_lower = {-1, 0, 256, 512, 1024, 2048, 3072, 3584, 4096, 6144, 8192, 12288, 16384, 32768, 65536};
+			static constexpr std::array<u64, 14> size_upper = {0, 256, 512, 1024, 2048, 3072, 3584, 4096, 6144, 8192, 12288, 16384, 32768, 65536};
+			static constexpr std::array<const char*, 7> draw_labels = {"0", "1", "2", "3", "4", "5-8", "9-16"};
+			static constexpr std::array<u32, 7> draw_lower = {0, 1, 2, 3, 4, 5, 9};
+			static constexpr std::array<u32, 7> draw_upper = {0, 1, 2, 3, 4, 8, 16};
+			static constexpr std::array<const char*, 9> slice_labels = {"1", "2", "3", "4", "5-8", "9-16", "17-32", "33-64", ">64"};
+			static constexpr std::array<const char*, 16> time_labels = {"<1us", "1-2us", "2-4us", "4-8us", "8-16us", "16-32us", "32-64us", "64-128us", "128-256us", "256-512us", "0.5-1ms", "1-2ms", "2-4ms", "4-8ms", "8-16ms", ">=16ms"};
+			static constexpr std::array<u32, 5> residence_us = {2, 4, 8, 16, 32};
+
+			std::string size_buckets;
+			for (usz i = 0; i < producer.size_buckets.size(); ++i)
+			{
+				const auto& bucket = producer.size_buckets[i];
+				size_buckets += fmt::format("%s{\"label\":\"%s\",\"lowerExclusive\":%lld,\"upperInclusive\":%s,\"inlineCalls\":%llu,\"inlineBytes\":%llu,\"queuedCalls\":%llu,\"queuedBytes\":%llu,\"emptyPushes\":%llu}",
+					i ? "," : "", size_labels[i], size_lower[i], i < size_upper.size() ? fmt::format("%llu", size_upper[i]) : "null",
+					bucket.inline_calls, bucket.inline_bytes, bucket.queued_calls, bucket.queued_bytes, bucket.empty_pushes);
+			}
+
+			std::string draw_buckets;
+			for (usz i = 0; i < producer.blocks_per_draw.size(); ++i)
+			{
+				draw_buckets += fmt::format("%s{\"label\":\"%s\",\"lowerInclusive\":%u,\"upperInclusive\":%u,\"drawsByInterleavedBlocks\":%llu,\"drawsByEligibleBlocks\":%llu,\"drawsByEmptyPushes\":%llu}",
+					i ? "," : "", draw_labels[i], draw_lower[i], draw_upper[i], producer.blocks_per_draw[i], producer.eligible_blocks_per_draw[i], producer.empty_pushes_per_draw[i]);
+			}
+
+			auto make_histogram = [](const auto& counts, const auto& labels)
+			{
+				std::string result;
+				for (usz i = 0; i < counts.size(); ++i)
+				{
+					result += fmt::format("%s{\"label\":\"%s\",\"count\":%llu}", i ? "," : "", labels[i], counts[i]);
+				}
+				return result;
+			};
+
+			std::string residence;
+			for (usz i = 0; i < worker.residence.size(); ++i)
+			{
+				const auto& prediction = worker.residence[i];
+				residence += fmt::format("%s{\"residenceUs\":%u,\"intervals\":%llu,\"arrivalsWithinR\":%llu,\"projectedExtraBusyUs\":%llu}",
+					i ? "," : "", residence_us[i], prediction.intervals, prediction.arrivals_within_r, prediction.projected_extra_busy_us);
+			}
+
+			const std::string payload = fmt::format(
+				"{\"schemaVersion\":1,\"runtimeIdentity\":{\"probeEpoch\":%llu,\"multithreadedRsx\":%s,\"rawCopyThresholdBytes\":%u},\"captureWallUs\":%llu,"
+				"\"producer\":{\"rawCalls\":%llu,\"rawBytes\":%llu,\"rawInlineCalls\":%llu,\"rawInlineBytes\":%llu,\"rawQueuedCalls\":%llu,\"rawQueuedBytes\":%llu,\"queueWasEmpty\":%llu,"
+				"\"emptyPushByWorkerPhase\":{\"processing\":%llu,\"prepark\":%llu,\"waitIntent\":%llu},\"persistentDraws\":%llu,\"interleavedBlocks\":%llu,\"offloadEligibleBlocks\":%llu,\"offloadEligibleBytes\":%llu,\"multiEligibleDraws\":%llu,\"zeroOrOneEligibleDraws\":%llu,\"predictedBatchJobsSaved\":%llu,\"predictedBatchNotifiesSaved\":%llu,\"sizeBuckets\":[%s],\"drawBuckets\":[%s]},"
+				"\"worker\":{\"popSlices\":%llu,\"processedJobs\":%llu,\"processedRawCalls\":%llu,\"processedRawBytes\":%llu,\"drainEqualEvents\":%llu,\"spinHits\":%llu,\"waitCalls\":%llu,\"waitReturnedImmediately\":%llu,"
+				"\"jobClasses\":{\"raw\":{\"jobs\":%llu,\"bytes\":%llu},\"vector\":{\"jobs\":%llu,\"bytes\":%llu},\"index\":{\"jobs\":%llu,\"bytes\":%llu},\"callback\":{\"jobs\":%llu,\"bytes\":%llu}},\"sliceJobBuckets\":[%s],\"idleGapBuckets\":[%s],\"residencePredictions\":[%s]},"
+				"\"sync\":{\"calls\":%llu,\"fast\":%llu,\"slowRsx\":%llu,\"slowOther\":0,\"slowCyclesTotal\":%llu,\"slowCyclesMax\":%llu,\"slowDurationBuckets\":[%s]},"
+				"\"integrity\":{\"probeComplete\":%s,\"droppedOrUnattributed\":%llu,\"producerQueuedRaw\":%llu,\"workerProcessedRaw\":%llu}}\n",
+				snapshot.probe_epoch, snapshot.multithreaded_rsx ? "true" : "false", snapshot.immediate_transfer_threshold, offloader_capture_wall_us,
+				producer.raw_calls, producer.raw_bytes, producer.raw_inline_calls, producer.raw_inline_bytes, producer.raw_queued_calls, producer.raw_queued_bytes, producer.queue_was_empty,
+				producer.empty_push_by_worker_phase[0], producer.empty_push_by_worker_phase[1], producer.empty_push_by_worker_phase[2], producer.persistent_draws, producer.interleaved_blocks,
+				producer.offload_eligible_blocks, producer.offload_eligible_bytes, producer.multi_eligible_draws, producer.zero_or_one_eligible_draws, producer.predicted_batch_jobs_saved, producer.predicted_batch_notifies_saved, size_buckets, draw_buckets,
+				worker.pop_slices, worker.processed_jobs, worker.processed_raw_calls, worker.processed_raw_bytes, worker.drain_equal_events, worker.spin_hits, worker.wait_calls, worker.wait_returned_immediately,
+				worker.jobs_by_type[0], worker.bytes_by_type[0], worker.jobs_by_type[1], worker.bytes_by_type[1], worker.jobs_by_type[2], worker.bytes_by_type[2], worker.jobs_by_type[3], worker.bytes_by_type[3],
+				make_histogram(worker.jobs_per_slice, slice_labels), make_histogram(worker.idle_gap, time_labels), residence,
+				producer.sync_calls_rsx, producer.sync_fast_rsx, producer.sync_slow_rsx, producer.sync_slow_cycles_total, producer.sync_slow_cycles_max, make_histogram(producer.sync_slow_duration, time_labels),
+				snapshot.probe_complete ? "true" : "false", snapshot.dropped_or_unattributed, producer.raw_queued_calls, worker.processed_raw_calls);
+
+			const std::string raw_path = output_path + ".offloader.raw.json";
+			const std::string parent = fs::get_parent_dir(raw_path);
+			if (!parent.empty() && !fs::create_path(parent) && fs::g_tls_error != fs::error::exist)
+			{
+				offloader_output_failed = true;
+				return false;
+			}
+
+			fs::pending_file output(raw_path);
+			if (!output.file || output.file.write(payload.data(), payload.size()) != payload.size() || !output.commit(false))
+			{
+				rsx_log.error("RSX offloader probe failed to write '%s': %s", raw_path, fs::g_tls_error);
+				offloader_output_failed = true;
+				return false;
+			}
+
+			offloader_output_committed = true;
+			return true;
+		}
+
 		bool write_status()
 		{
 			std::string issue_list;
@@ -301,7 +427,7 @@ namespace rsx
 				issue_list += fmt::format("\"%s\"", escape_json_string(issues[index]));
 			}
 
-			const bool valid = issues.empty() && !output_failed && capture_completed;
+			const bool valid = issues.empty() && !output_failed && !offloader_output_failed && offloader_output_committed && capture_completed;
 			const std::string payload = fmt::format(
 				"{\n  \"schemaVersion\": 1,\n  \"status\": \"%s\",\n  \"valid\": %s,\n  \"recordsWritten\": %llu,\n  \"issues\": [%s]\n}\n",
 				valid ? "complete" : "invalid",
@@ -1491,7 +1617,56 @@ namespace rsx
 		std::this_thread::sleep_for(10ms);
 		do_local_task(rsx::FIFO::state::lock_wait);
 
-		g_fxo->get<rsx::dma_manager>().join();
+		auto& dma = g_fxo->get<rsx::dma_manager>();
+		bool end_offloader_probe = false;
+		if (m_perf_probe)
+		{
+			auto& probe = *m_perf_probe;
+			std::lock_guard lock(probe.mutex);
+			if (!probe.finalized && (m_perf_probe_armed.load() || probe.transition != perf_probe_state::transition_state::idle))
+			{
+				probe.add_issue("process_exit_while_armed");
+				if (probe.transition != perf_probe_state::transition_state::idle)
+				{
+					probe.add_issue("process_exit_during_probe_transition");
+				}
+				probe.transition = perf_probe_state::transition_state::exiting;
+				m_perf_probe_armed.store(false);
+				end_offloader_probe = probe.capture_started;
+			}
+		}
+
+		if (end_offloader_probe)
+		{
+			const u64 exit_boundary_us = get_system_time();
+			dma_manager::probe_snapshot snapshot{};
+			const bool complete = dma.probe_end(snapshot);
+			auto& probe = *m_perf_probe;
+			std::lock_guard lock(probe.mutex);
+			if (exit_boundary_us > probe.offloader_capture_begin_us)
+			{
+				probe.offloader_capture_wall_us = exit_boundary_us - probe.offloader_capture_begin_us;
+			}
+			else
+			{
+				probe.offloader_capture_wall_us = 0;
+				probe.add_issue("offloader_capture_wall_time_invalid");
+			}
+			probe.offloader_snapshot = snapshot;
+			probe.offloader_snapshot_available = snapshot.snapshot_available;
+			if (!complete)
+			{
+				probe.add_issue("offloader_probe_end_incomplete_at_exit");
+			}
+		}
+		if (end_offloader_probe)
+		{
+			// Publish the frozen abnormal-exit evidence before join tears down DMA.
+			// finalize_perf_probe() is deliberately DMA-free and is idempotent.
+			finalize_perf_probe();
+		}
+
+		dma.join();
 
 		finalize_perf_probe();
 
@@ -3610,10 +3785,15 @@ namespace rsx
 
 		m_perf_probe_armed.store(false);
 		m_perf_probe_fifo_local_task_paused = false;
+		probe.transition = perf_probe_state::transition_state::idle;
 
 		if (!probe.flush())
 		{
 			probe.add_issue("csv_output_failed");
+		}
+		if (!probe.write_offloader_raw())
+		{
+			probe.add_issue("offloader_raw_output_failed");
 		}
 
 		probe.finalized = probe.write_status();
@@ -3944,7 +4124,7 @@ namespace rsx
 		if (m_perf_probe) [[unlikely]]
 		{
 			auto& probe = *m_perf_probe;
-			std::lock_guard lock(probe.mutex);
+			std::unique_lock lock(probe.mutex);
 			const bool arm_requested = !probe.finalized && fs::is_file(probe.arm_path);
 			if ((arm_requested || m_perf_probe_armed.load()) && !is_current_thread())
 			{
@@ -3955,7 +4135,12 @@ namespace rsx
 			// display/debug users, irrespective of probe state.
 			m_queued_flip.stats = m_frame_stats;
 
-			if (m_perf_probe_armed.load())
+			if (probe.transition != perf_probe_state::transition_state::idle)
+			{
+				// probe_begin/probe_end may synchronously service a re-entrant flip.
+				// The outer boundary owns the state transition and capture boundary.
+			}
+			else if (m_perf_probe_armed.load())
 			{
 				const u64 boundary_us = get_system_time();
 				u64 cpu_time_ns = 0;
@@ -4015,6 +4200,7 @@ namespace rsx
 				{
 					// The first boundary after disarm closes the final complete interval.
 					m_perf_probe_armed.store(false);
+					probe.transition = perf_probe_state::transition_state::disarming;
 					m_perf_probe_fifo_starvation_timestamp = 0;
 					m_perf_probe_fifo_empty_after_nop = false;
 					m_perf_probe_fifo_local_task_paused = false;
@@ -4024,62 +4210,113 @@ namespace rsx
 					m_perf_probe_submit_frontend_nested_start = 0;
 					m_perf_probe_offloader_sync_timestamp = 0;
 					m_perf_probe_offloader_sync_nested_start = 0;
+
+					lock.unlock();
+					dma_manager::probe_snapshot snapshot{};
+					const bool offloader_complete = g_fxo->get<rsx::dma_manager>().probe_end(snapshot);
+					lock.lock();
+					probe.transition = perf_probe_state::transition_state::idle;
+					if (boundary_us > probe.offloader_capture_begin_us)
+					{
+						probe.offloader_capture_wall_us = boundary_us - probe.offloader_capture_begin_us;
+					}
+					else
+					{
+						probe.offloader_capture_wall_us = 0;
+						probe.add_issue("offloader_capture_wall_time_invalid");
+					}
+					probe.offloader_snapshot = snapshot;
+					probe.offloader_snapshot_available = snapshot.snapshot_available;
 					probe.capture_completed = true;
+					if (!offloader_complete)
+					{
+						probe.add_issue("offloader_probe_end_incomplete");
+					}
 
 					if (!probe.flush())
 					{
 						probe.add_issue("csv_output_failed");
 					}
+					if (!probe.write_offloader_raw())
+					{
+						probe.add_issue("offloader_raw_output_failed");
+					}
 
 					probe.finalized = probe.write_status();
 				}
 			}
-			else if (!probe.capture_started && arm_requested)
+			else if (!probe.arm_attempted && !probe.capture_started && arm_requested)
 			{
 				// Arm only at a boundary. Everything before this point is discarded;
 				// all post-boundary flip/submit/wait work enters the new interval.
-				const u64 boundary_us = get_system_time();
-				u64 cpu_time_ns = 0;
-				const bool cpu_time_available = get_current_thread_cpu_time_ns(cpu_time_ns);
-				m_frame_stats = {};
-				const u64 new_frame_id = probe.next_frame_id.fetch_add(1) + 1;
-				m_frame_stats.perf_probe_frame_id = new_frame_id;
-				probe.last_boundary_us = boundary_us;
-				probe.last_cpu_time_ns = cpu_time_ns;
-				probe.cpu_time_available = cpu_time_available;
-				probe.capture_started = true;
-				m_perf_probe_armed.store(true);
-				if (m_perf_probe_guest_wait_active)
+				probe.arm_attempted = true;
+				probe.transition = perf_probe_state::transition_state::arming;
+				lock.unlock();
+				const bool offloader_started = g_fxo->get<rsx::dma_manager>().probe_begin(probe.offloader_epoch);
+				lock.lock();
+				probe.transition = perf_probe_state::transition_state::idle;
+				if (!offloader_started)
 				{
-					m_perf_probe_guest_wait_timestamp = boundary_us;
-					m_perf_probe_guest_nested_start = 0;
-				}
-				if (m_perf_probe_submit_frontend_active)
-				{
-					m_perf_probe_submit_frontend_timestamp = boundary_us;
-					m_perf_probe_submit_frontend_nested_start = 0;
-				}
-				if (m_perf_probe_offloader_sync_active)
-				{
-					m_perf_probe_offloader_sync_timestamp = boundary_us;
-					m_perf_probe_offloader_sync_nested_start = 0;
-				}
-
-				if (!m_perf_probe_fifo_local_task_paused &&
-					(performance_counters.state == FIFO::state::empty ||
-					performance_counters.state == FIFO::state::spinning ||
-					(performance_counters.state == FIFO::state::nop && m_perf_probe_fifo_empty_after_nop)))
-				{
-					m_perf_probe_fifo_starvation_timestamp = boundary_us;
+					probe.add_issue("offloader_probe_begin_failed");
+					if (!probe.flush())
+					{
+						probe.add_issue("csv_output_failed");
+					}
+					if (!probe.write_offloader_raw())
+					{
+						probe.add_issue("offloader_raw_output_failed");
+					}
+					// The validity status is deliberately the last artifact. A failed
+					// begin is terminal for this one-run probe and must never be retried
+					// at every subsequent frame boundary.
+					probe.finalized = probe.write_status();
 				}
 				else
 				{
-					m_perf_probe_fifo_starvation_timestamp = 0;
-				}
+					const u64 boundary_us = get_system_time();
+					u64 cpu_time_ns = 0;
+					const bool cpu_time_available = get_current_thread_cpu_time_ns(cpu_time_ns);
+					m_frame_stats = {};
+					const u64 new_frame_id = probe.next_frame_id.fetch_add(1) + 1;
+					m_frame_stats.perf_probe_frame_id = new_frame_id;
+					probe.last_boundary_us = boundary_us;
+					probe.offloader_capture_begin_us = boundary_us;
+					probe.last_cpu_time_ns = cpu_time_ns;
+					probe.cpu_time_available = cpu_time_available;
+					probe.capture_started = true;
+					m_perf_probe_armed.store(true);
+					if (m_perf_probe_guest_wait_active)
+					{
+						m_perf_probe_guest_wait_timestamp = boundary_us;
+						m_perf_probe_guest_nested_start = 0;
+					}
+					if (m_perf_probe_submit_frontend_active)
+					{
+						m_perf_probe_submit_frontend_timestamp = boundary_us;
+						m_perf_probe_submit_frontend_nested_start = 0;
+					}
+					if (m_perf_probe_offloader_sync_active)
+					{
+						m_perf_probe_offloader_sync_timestamp = boundary_us;
+						m_perf_probe_offloader_sync_nested_start = 0;
+					}
 
-				if (!cpu_time_available)
-				{
-					probe.add_issue("thread_cpu_time_unavailable");
+					if (!m_perf_probe_fifo_local_task_paused &&
+						(performance_counters.state == FIFO::state::empty ||
+						performance_counters.state == FIFO::state::spinning ||
+						(performance_counters.state == FIFO::state::nop && m_perf_probe_fifo_empty_after_nop)))
+					{
+						m_perf_probe_fifo_starvation_timestamp = boundary_us;
+					}
+					else
+					{
+						m_perf_probe_fifo_starvation_timestamp = 0;
+					}
+
+					if (!cpu_time_available)
+					{
+						probe.add_issue("thread_cpu_time_unavailable");
+					}
 				}
 			}
 		}

@@ -547,15 +547,58 @@ namespace rsx
 
 		if (persistent != nullptr)
 		{
-			for (interleaved_range_info* block : layout.interleaved_blocks)
+			auto& probe_dma = g_fxo->get<rsx::dma_manager>();
+			if (!probe_dma.probe_is_enabled()) [[likely]]
 			{
-				auto range = block->calculate_required_range(first_vertex, vertex_count);
+				// Preserve the original hot loop when the one-run measurement gate is
+				// closed. No probe calls or per-block counters execute on this path.
+				for (interleaved_range_info* block : layout.interleaved_blocks)
+				{
+					auto range = block->calculate_required_range(first_vertex, vertex_count);
 
-				const u32 data_size = range.second * block->attribute_stride;
-				const u32 vertex_base = range.first * block->attribute_stride;
+					const u32 data_size = range.second * block->attribute_stride;
+					const u32 vertex_base = range.first * block->attribute_stride;
 
-				g_fxo->get<rsx::dma_manager>().copy(persistent, vm::_ptr<char>(block->real_offset_address) + vertex_base, data_size);
-				persistent += data_size;
+					g_fxo->get<rsx::dma_manager>().copy(persistent, vm::_ptr<char>(block->real_offset_address) + vertex_base, data_size);
+					persistent += data_size;
+				}
+			}
+			else
+			{
+				struct probe_draw_scope
+				{
+					dma_manager& dma;
+					dma_manager::probe_draw_token token;
+					u32 blocks = 0;
+					u32 eligible_blocks = 0;
+					u64 eligible_bytes = 0;
+					bool complete = false;
+
+					~probe_draw_scope()
+					{
+						dma.probe_end_persistent_draw(token, blocks, eligible_blocks, eligible_bytes, complete);
+					}
+				} probe_scope{probe_dma, probe_dma.probe_begin_persistent_draw()};
+
+				for (interleaved_range_info* block : layout.interleaved_blocks)
+				{
+					auto range = block->calculate_required_range(first_vertex, vertex_count);
+
+					const u32 data_size = range.second * block->attribute_stride;
+					const u32 vertex_base = range.first * block->attribute_stride;
+
+					probe_scope.blocks++;
+					if (data_size > probe_dma.probe_immediate_transfer_threshold())
+					{
+						probe_scope.eligible_blocks++;
+						probe_scope.eligible_bytes += data_size;
+					}
+
+					probe_dma.copy(persistent, vm::_ptr<char>(block->real_offset_address) + vertex_base, data_size);
+					persistent += data_size;
+				}
+
+				probe_scope.complete = true;
 			}
 		}
 	}
