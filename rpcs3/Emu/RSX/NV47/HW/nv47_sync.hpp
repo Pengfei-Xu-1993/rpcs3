@@ -19,10 +19,17 @@ namespace rsx
 			if (!is_flip_sema)
 			{
 				// First, queue the GPU work. If it flushes the queue for us, the following routines will be faster.
-				const bool handled = RSX(ctx)->get_backend_config().supports_host_gpu_labels && RSX(ctx)->release_GCM_label(type, address, data);
+				auto& dma = g_fxo->get<rsx::dma_manager>();
+				const bool supports_host_gpu_labels = RSX(ctx)->get_backend_config().supports_host_gpu_labels;
+				if (!supports_host_gpu_labels)
+				{
+					dma.probe_record_gcm_label_branch(dma_manager::probe_gcm_label_branch::unsupported);
+				}
+				const bool handled = supports_host_gpu_labels && RSX(ctx)->release_GCM_label(type, address, data);
 
 				if (vm::_ref<RsxSemaphore>(address) == data)
 				{
+					dma.probe_record_gcm_label_same_value_early_return();
 					// It's a no-op to write the same value (although there is a delay in real-hw so it's more accurate to allow GPU label in this case)
 					return;
 				}
@@ -35,8 +42,20 @@ namespace rsx
 
 					if constexpr (FlushDMA)
 					{
+						if constexpr (!FlushPipe)
+						{
+							if (type == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE && !handled &&
+								dma.try_enqueue_ordered_gcm_label_write(address, data))
+							{
+								return;
+							}
+						}
+
 						// If the backend handled the request, this call will basically be a NOP
-						g_fxo->get<rsx::dma_manager>().sync();
+						const auto context = type == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE
+							? (handled ? dma_manager::probe_sync_context::gcm_texture_handled : dma_manager::probe_sync_context::gcm_texture_fallback)
+							: (handled ? dma_manager::probe_sync_context::gcm_backend_handled : dma_manager::probe_sync_context::gcm_backend_fallback);
+						dma.sync(context);
 					}
 
 					if constexpr (FlushPipe)
