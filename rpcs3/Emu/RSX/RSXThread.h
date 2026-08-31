@@ -505,6 +505,13 @@ namespace rsx
 			u64 submit_visible_us,
 			u64 query_wait_us,
 			u32 query_index_count);
+		void record_perf_probe_vertex_multiblock_shadow(
+			const vertex_input_layout& layout,
+			u32 first_vertex,
+			u32 vertex_count,
+			u32 persistent_heap_offset,
+			u32 persistent_bytes,
+			u32 offloader_threshold_bytes);
 
 	private:
 		void add_perf_probe_time_impl(perf_probe_field field, u64 elapsed_us);

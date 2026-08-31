@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 
 #ifdef _WIN32
@@ -170,12 +171,77 @@ namespace rsx
 			u32 query_index_count;
 		};
 
+		static constexpr usz vertex_multiblock_max_ranges = 16;
+
+		struct vertex_multiblock_key
+		{
+			u8 range_count = 0;
+			std::array<u64, vertex_multiblock_max_ranges> ranges{};
+
+			bool operator==(const vertex_multiblock_key& other) const
+			{
+				return range_count == other.range_count &&
+					std::equal(ranges.begin(), ranges.begin() + range_count, other.ranges.begin());
+			}
+		};
+
+		struct vertex_multiblock_key_hash
+		{
+			usz operator()(const vertex_multiblock_key& key) const
+			{
+				u64 hash = 1469598103934665603ull;
+				for (usz index = 0; index < key.range_count; ++index)
+				{
+					hash ^= key.ranges[index];
+					hash *= 1099511628211ull;
+				}
+
+				return static_cast<usz>(hash ^ (hash >> 32));
+			}
+		};
+
+		struct vertex_multiblock_entry
+		{
+			std::array<u64, vertex_multiblock_max_ranges> first_fingerprints{};
+			std::array<u64, vertex_multiblock_max_ranges> last_fingerprints{};
+			std::array<u32, vertex_multiblock_max_ranges> heap_offsets{};
+			u32 raw_copy_calls = 0;
+			u32 offloader_jobs = 0;
+			u64 raw_copy_bytes = 0;
+			u64 offloader_bytes = 0;
+			bool heap_contiguous = false;
+		};
+
+		struct vertex_multiblock_stats
+		{
+			u64 frames_with_draws = 0;
+			u64 draws = 0;
+			u64 frame_scoped_unique_signatures = 0;
+			u64 signature_repeat_draws = 0;
+			u64 fingerprint_stable_repeat_draws = 0;
+			u64 fingerprint_changed_repeat_draws = 0;
+			u64 first_fingerprint_changed_blocks = 0;
+			u64 last_fingerprint_changed_blocks = 0;
+			u64 any_fingerprint_changed_blocks = 0;
+			u64 contiguous_first_occurrences = 0;
+			u64 contiguous_stable_repeats = 0;
+			u64 noncontiguous_stable_repeats = 0;
+			u64 reusable_draws = 0;
+			u64 potential_raw_copy_calls_saved = 0;
+			u64 potential_raw_copy_bytes_saved = 0;
+			u64 potential_offloader_jobs_saved = 0;
+			u64 potential_offloader_bytes_saved = 0;
+			u64 unrepresentable_draws = 0;
+			std::array<u64, vertex_multiblock_max_ranges + 1> block_count_histogram{};
+		};
+
 		explicit perf_probe_state(std::string path, std::string arm)
 			: output_path(std::move(path))
 			, arm_path(std::move(arm))
 		{
 			completed_frames.reserve(4096);
 			zcull_lifecycle_records.reserve(4096);
+			vertex_multiblock_frame_entries.reserve(4096);
 		}
 
 		std::string output_path;
@@ -183,6 +249,8 @@ namespace rsx
 		std::mutex mutex;
 		std::vector<record> completed_frames;
 		std::vector<zcull_lifecycle_record> zcull_lifecycle_records;
+		std::unordered_map<vertex_multiblock_key, vertex_multiblock_entry, vertex_multiblock_key_hash> vertex_multiblock_frame_entries;
+		vertex_multiblock_stats vertex_multiblock{};
 		std::vector<std::string> issues;
 		atomic_t<u64> next_frame_id{0};
 		u64 last_boundary_us = 0;
@@ -205,6 +273,10 @@ namespace rsx
 		bool offloader_output_failed = false;
 		bool zcull_lifecycle_output_committed = false;
 		bool zcull_lifecycle_output_failed = false;
+		bool vertex_multiblock_output_committed = false;
+		bool vertex_multiblock_output_failed = false;
+		u64 vertex_multiblock_frame_id = 0;
+		u32 vertex_multiblock_offloader_threshold_bytes = 0;
 
 		void add_issue(std::string issue)
 		{
@@ -358,6 +430,81 @@ namespace rsx
 
 			zcull_lifecycle_records.clear();
 			zcull_lifecycle_output_committed = true;
+			return true;
+		}
+
+		bool write_vertex_multiblock_shadow()
+		{
+			if (vertex_multiblock_output_committed)
+			{
+				return true;
+			}
+
+			if (vertex_multiblock_output_failed)
+			{
+				return false;
+			}
+
+			std::string block_histogram;
+			for (usz blocks = 2; blocks < vertex_multiblock.block_count_histogram.size(); ++blocks)
+			{
+				block_histogram += fmt::format(
+					"%s{\"blocks\":%u,\"draws\":%llu}",
+					blocks == 2 ? "" : ",",
+					static_cast<u32>(blocks),
+					vertex_multiblock.block_count_histogram[blocks]);
+			}
+
+			const std::string payload = fmt::format(
+				"{\"schemaVersion\":1,\"measurementOnly\":true,\"renderBehaviorChanged\":false,\"timingPerturbed\":true,"
+				"\"cacheModel\":{\"scope\":\"same-frame\",\"signature\":\"ordered(sourceAddress,byteLength)\",\"wholeDrawHitRequired\":true,\"offloaderThresholdBytes\":%u},"
+				"\"fingerprint\":{\"bytesPerEdge\":8,\"samples\":[\"first\",\"last\"],\"shortRangesUseAllBytes\":true,\"middleBytesNotHashed\":true},"
+				"\"capture\":{\"framesWithMultiBlockDraws\":%llu,\"multiBlockDraws\":%llu,\"frameScopedUniqueSignatures\":%llu,\"blockCountHistogram\":[%s]},"
+				"\"repeats\":{\"signatureRepeatDraws\":%llu,\"fingerprintStableRepeatDraws\":%llu,\"fingerprintChangedRepeatDraws\":%llu,"
+				"\"firstFingerprintChangedBlocks\":%llu,\"lastFingerprintChangedBlocks\":%llu,\"anyFingerprintChangedBlocks\":%llu},"
+				"\"heapContinuity\":{\"contiguousFirstOccurrences\":%llu,\"contiguousFingerprintStableRepeats\":%llu,\"noncontiguousFingerprintStableRepeats\":%llu},"
+				"\"potentialSavings\":{\"reusableDraws\":%llu,\"rawCopyCalls\":%llu,\"rawCopyBytes\":%llu,\"offloaderJobs\":%llu,\"offloaderBytes\":%llu},"
+				"\"integrity\":{\"unrepresentableDraws\":%llu}}\n",
+				vertex_multiblock_offloader_threshold_bytes,
+				vertex_multiblock.frames_with_draws,
+				vertex_multiblock.draws,
+				vertex_multiblock.frame_scoped_unique_signatures,
+				block_histogram,
+				vertex_multiblock.signature_repeat_draws,
+				vertex_multiblock.fingerprint_stable_repeat_draws,
+				vertex_multiblock.fingerprint_changed_repeat_draws,
+				vertex_multiblock.first_fingerprint_changed_blocks,
+				vertex_multiblock.last_fingerprint_changed_blocks,
+				vertex_multiblock.any_fingerprint_changed_blocks,
+				vertex_multiblock.contiguous_first_occurrences,
+				vertex_multiblock.contiguous_stable_repeats,
+				vertex_multiblock.noncontiguous_stable_repeats,
+				vertex_multiblock.reusable_draws,
+				vertex_multiblock.potential_raw_copy_calls_saved,
+				vertex_multiblock.potential_raw_copy_bytes_saved,
+				vertex_multiblock.potential_offloader_jobs_saved,
+				vertex_multiblock.potential_offloader_bytes_saved,
+				vertex_multiblock.unrepresentable_draws);
+
+			const std::string shadow_path = output_path + ".vertex-multiblock-shadow.json";
+			const std::string parent = fs::get_parent_dir(shadow_path);
+			if (!parent.empty() && !fs::create_path(parent) && fs::g_tls_error != fs::error::exist)
+			{
+				rsx_log.error("RSX vertex multiblock shadow probe failed to create output directory '%s': %s", parent, fs::g_tls_error);
+				vertex_multiblock_output_failed = true;
+				return false;
+			}
+
+			fs::pending_file output(shadow_path);
+			if (!output.file || output.file.write(payload.data(), payload.size()) != payload.size() || !output.commit(false))
+			{
+				rsx_log.error("RSX vertex multiblock shadow probe failed to write '%s': %s", shadow_path, fs::g_tls_error);
+				vertex_multiblock_output_failed = true;
+				return false;
+			}
+
+			vertex_multiblock_frame_entries.clear();
+			vertex_multiblock_output_committed = true;
 			return true;
 		}
 
@@ -515,7 +662,8 @@ namespace rsx
 				issue_list += fmt::format("\"%s\"", escape_json_string(issues[index]));
 			}
 
-			const bool valid = issues.empty() && !output_failed && !offloader_output_failed && !zcull_lifecycle_output_failed && offloader_output_committed && zcull_lifecycle_output_committed && capture_completed;
+			const bool valid = issues.empty() && !output_failed && !offloader_output_failed && !zcull_lifecycle_output_failed && !vertex_multiblock_output_failed &&
+				offloader_output_committed && zcull_lifecycle_output_committed && vertex_multiblock_output_committed && capture_completed;
 			const std::string payload = fmt::format(
 				"{\n  \"schemaVersion\": 1,\n  \"status\": \"%s\",\n  \"valid\": %s,\n  \"recordsWritten\": %llu,\n  \"issues\": [%s]\n}\n",
 				valid ? "complete" : "invalid",
@@ -3887,6 +4035,10 @@ namespace rsx
 		{
 			probe.add_issue("zcull_lifecycle_output_failed");
 		}
+		if (!probe.write_vertex_multiblock_shadow())
+		{
+			probe.add_issue("vertex_multiblock_shadow_output_failed");
+		}
 
 		probe.finalized = probe.write_status();
 	}
@@ -3941,6 +4093,147 @@ namespace rsx
 			submit_visible_us >= get_entry_us ? submit_visible_us - get_entry_us : 0,
 			query_wait_us,
 			query_index_count});
+	}
+
+	void thread::record_perf_probe_vertex_multiblock_shadow(
+		const vertex_input_layout& layout,
+		u32 first_vertex,
+		u32 vertex_count,
+		u32 persistent_heap_offset,
+		u32 persistent_bytes,
+		u32 offloader_threshold_bytes)
+	{
+		if (!m_perf_probe)
+		{
+			return;
+		}
+
+		auto& probe = *m_perf_probe;
+		std::lock_guard lock(probe.mutex);
+		if (!m_perf_probe_armed.load() || !m_frame_stats.perf_probe_frame_id)
+		{
+			return;
+		}
+
+		auto& stats = probe.vertex_multiblock;
+		const usz range_count = layout.interleaved_blocks.size();
+		stats.draws++;
+		probe.vertex_multiblock_offloader_threshold_bytes = offloader_threshold_bytes;
+
+		if (range_count <= 1 || range_count > perf_probe_state::vertex_multiblock_max_ranges)
+		{
+			stats.unrepresentable_draws++;
+			return;
+		}
+
+		if (probe.vertex_multiblock_frame_id != m_frame_stats.perf_probe_frame_id)
+		{
+			probe.vertex_multiblock_frame_entries.clear();
+			probe.vertex_multiblock_frame_id = m_frame_stats.perf_probe_frame_id;
+			stats.frames_with_draws++;
+		}
+
+		stats.block_count_histogram[range_count]++;
+
+		perf_probe_state::vertex_multiblock_key key{};
+		perf_probe_state::vertex_multiblock_entry current{};
+		key.range_count = static_cast<u8>(range_count);
+		current.raw_copy_calls = static_cast<u32>(range_count);
+		current.heap_contiguous = true;
+
+		for (usz index = 0; index < range_count; ++index)
+		{
+			auto* block = layout.interleaved_blocks[index];
+			const auto range = block->calculate_required_range(first_vertex, vertex_count);
+			const u32 byte_length = range.second * block->attribute_stride;
+			const u32 vertex_base_bytes = range.first * block->attribute_stride;
+			const u32 source_address = block->real_offset_address + vertex_base_bytes;
+			const u64 heap_offset = static_cast<u64>(persistent_heap_offset) + current.raw_copy_bytes;
+
+			key.ranges[index] = (static_cast<u64>(source_address) << 32) | byte_length;
+			if (heap_offset > 0xffff'ffffull)
+			{
+				current.heap_contiguous = false;
+			}
+			else
+			{
+				current.heap_offsets[index] = static_cast<u32>(heap_offset);
+			}
+
+			if (byte_length)
+			{
+				// Match the weak-cache cost model while covering both edges. This is
+				// deliberately not a full hash; the sidecar records that limitation.
+				const auto* source = vm::get_super_ptr<const u8>(source_address);
+				const usz sample_bytes = std::min<usz>(8, byte_length);
+				std::memcpy(&current.first_fingerprints[index], source, sample_bytes);
+				std::memcpy(&current.last_fingerprints[index], source + byte_length - sample_bytes, sample_bytes);
+			}
+
+			current.raw_copy_bytes += byte_length;
+			if (byte_length > offloader_threshold_bytes)
+			{
+				current.offloader_jobs++;
+				current.offloader_bytes += byte_length;
+			}
+		}
+
+		const u64 heap_end = static_cast<u64>(persistent_heap_offset) + current.raw_copy_bytes;
+		current.heap_contiguous = current.heap_contiguous &&
+			current.raw_copy_bytes == persistent_bytes && heap_end <= 0x1'0000'0000ull;
+		auto [found, inserted] = probe.vertex_multiblock_frame_entries.try_emplace(key, current);
+		if (inserted)
+		{
+			stats.frame_scoped_unique_signatures++;
+			if (current.heap_contiguous)
+			{
+				stats.contiguous_first_occurrences++;
+			}
+			return;
+		}
+
+		stats.signature_repeat_draws++;
+		auto& cached = found->second;
+		bool fingerprint_changed = false;
+		for (usz index = 0; index < range_count; ++index)
+		{
+			const bool first_changed = cached.first_fingerprints[index] != current.first_fingerprints[index];
+			const bool last_changed = cached.last_fingerprints[index] != current.last_fingerprints[index];
+			stats.first_fingerprint_changed_blocks += first_changed;
+			stats.last_fingerprint_changed_blocks += last_changed;
+			stats.any_fingerprint_changed_blocks += first_changed || last_changed;
+			fingerprint_changed |= first_changed || last_changed;
+		}
+
+		if (fingerprint_changed)
+		{
+			stats.fingerprint_changed_repeat_draws++;
+			cached = current;
+			return;
+		}
+
+		stats.fingerprint_stable_repeat_draws++;
+		bool cached_heap_contiguous = cached.heap_contiguous;
+		u64 expected_heap_offset = cached.heap_offsets[0];
+		for (usz index = 0; cached_heap_contiguous && index < range_count; ++index)
+		{
+			cached_heap_contiguous = cached.heap_offsets[index] == expected_heap_offset;
+			expected_heap_offset += static_cast<u32>(key.ranges[index]);
+		}
+
+		if (!cached_heap_contiguous)
+		{
+			stats.noncontiguous_stable_repeats++;
+			cached = current;
+			return;
+		}
+
+		stats.contiguous_stable_repeats++;
+		stats.reusable_draws++;
+		stats.potential_raw_copy_calls_saved += current.raw_copy_calls;
+		stats.potential_raw_copy_bytes_saved += current.raw_copy_bytes;
+		stats.potential_offloader_jobs_saved += current.offloader_jobs;
+		stats.potential_offloader_bytes_saved += current.offloader_bytes;
 	}
 
 	void thread::split_perf_probe_guest_wait_segment(u64 boundary_us)
@@ -4375,6 +4668,10 @@ namespace rsx
 					{
 						probe.add_issue("zcull_lifecycle_output_failed");
 					}
+					if (!probe.write_vertex_multiblock_shadow())
+					{
+						probe.add_issue("vertex_multiblock_shadow_output_failed");
+					}
 
 					probe.finalized = probe.write_status();
 				}
@@ -4403,6 +4700,10 @@ namespace rsx
 					if (!probe.write_zcull_lifecycle())
 					{
 						probe.add_issue("zcull_lifecycle_output_failed");
+					}
+					if (!probe.write_vertex_multiblock_shadow())
+					{
+						probe.add_issue("vertex_multiblock_shadow_output_failed");
 					}
 					// The validity status is deliberately the last artifact. A failed
 					// begin is terminal for this one-run probe and must never be retried

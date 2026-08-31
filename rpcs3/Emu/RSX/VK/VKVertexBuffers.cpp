@@ -271,6 +271,19 @@ vk::vertex_upload_info VKGSRender::upload_vertex_data()
 			persistent_offset = static_cast<u32>(m_attrib_ring_info.alloc<256>(required.first));
 			persistent_range_base = static_cast<u32>(persistent_offset);
 
+			// This shadow path observes the source ranges and the real packed heap
+			// allocation. It never changes cache state or suppresses an upload.
+			if (m_vertex_layout.interleaved_blocks.size() > 1 && perf_probe_enabled()) [[unlikely]]
+			{
+				record_perf_probe_vertex_multiblock_shadow(
+					m_vertex_layout,
+					vertex_base,
+					vertex_count,
+					static_cast<u32>(persistent_offset),
+					required.first,
+					g_fxo->get<rsx::dma_manager>().probe_immediate_transfer_threshold());
+			}
+
 			if (to_store)
 			{
 				//store ref in vertex cache
