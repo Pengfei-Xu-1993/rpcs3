@@ -1658,9 +1658,28 @@ void VKGSRender::write_barrier(u32 address, u32 range)
 void VKGSRender::sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync_hint_payload_t payload)
 {
 	rsx::thread::sync_hint(hint, payload);
+	using age_hint_state = rsx::reports::occlusion_query_info::perf_probe_age_hint_state;
+	const bool probing_age_hint = payload.query && payload.query->perf_probe_age_hint == age_hint_state::in_call;
 
 	if (!(m_current_command_buffer->flags & vk::command_buffer::cb_has_occlusion_task))
 	{
+		if (probing_age_hint)
+		{
+			auto& probe_data = m_occlusion_map[payload.query->driver_handle];
+			if (probe_data.indices.empty())
+			{
+				payload.query->perf_probe_age_hint = age_hint_state::no_indices;
+			}
+			else if (!probe_data.is_current(m_current_command_buffer))
+			{
+				payload.query->perf_probe_age_hint = age_hint_state::already_submitted;
+			}
+			else
+			{
+				payload.query->perf_probe_age_hint = age_hint_state::no_occlusion_task;
+			}
+		}
+
 		// Occlusion queries not enabled, do nothing
 		return;
 	}
@@ -1705,14 +1724,40 @@ void VKGSRender::sync_hint(rsx::FIFO::interrupt_hint hint, rsx::reports::sync_hi
 
 		// NOTE: Currently, a special condition exists where the indices can be empty even with active draw count.
 		// This is caused by async compiler and should be removed when ubershaders are added in
-		if (!data.is_current(m_current_command_buffer) || data.indices.empty())
+		if (data.indices.empty())
 		{
+			if (probing_age_hint)
+			{
+				payload.query->perf_probe_age_hint = age_hint_state::no_indices;
+			}
+
+			return;
+		}
+
+		if (!data.is_current(m_current_command_buffer))
+		{
+			if (probing_age_hint)
+			{
+				payload.query->perf_probe_age_hint = age_hint_state::already_submitted;
+			}
+
 			return;
 		}
 
 		// Unavoidable hard sync coming up, flush immediately
 		// This heavyweight hint should be used with caution
 		std::lock_guard lock(m_flush_queue_mutex);
+		if (probing_age_hint)
+		{
+			payload.query->perf_probe_age_hint = age_hint_state::flushed;
+		}
+		if (perf_probe_enabled())
+		{
+			if (!payload.query->perf_probe_first_zcull_flush_us)
+			{
+				payload.query->perf_probe_first_zcull_flush_us = get_system_time();
+			}
+		}
 		flush_command_queue();
 
 		if (m_flush_requests.pending())
@@ -2838,8 +2883,22 @@ bool VKGSRender::check_occlusion_query_status(rsx::reports::occlusion_query_info
 void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info* query)
 {
 	auto &data = m_occlusion_map[query->driver_handle];
+	const bool probe_lifecycle = perf_probe_enabled() && is_current_thread();
+	const u64 probe_frame_id = probe_lifecycle ? m_frame_stats.perf_probe_frame_id : 0;
+	const u64 probe_get_entry_us = probe_lifecycle ? get_system_time() : 0;
+	const u64 probe_wait_before_us = probe_lifecycle ? m_frame_stats.zcull_query_wait_us : 0;
+	const u32 probe_query_index_count = ::size32(data.indices);
+	u64 probe_submit_visible_us = probe_get_entry_us;
+
 	if (data.indices.empty())
+	{
+		if (probe_lifecycle)
+		{
+			record_perf_probe_zcull_lifecycle(*query, probe_frame_id, probe_get_entry_us, probe_submit_visible_us, 0, probe_query_index_count);
+		}
+
 		return;
+	}
 
 	if (query->num_draws)
 	{
@@ -2858,6 +2917,10 @@ void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info* 
 		}
 
 		data.sync();
+		if (probe_lifecycle)
+		{
+			probe_submit_visible_us = get_system_time();
+		}
 
 		// Gather data. The query manager measures only actual readiness polling;
 		// cached results and loop bookkeeping are excluded.
@@ -2874,6 +2937,13 @@ void VKGSRender::get_occlusion_query_result(rsx::reports::occlusion_query_info* 
 
 	m_occlusion_query_manager->free_queries(*m_current_command_buffer, data.indices);
 	data.indices.clear();
+
+	if (probe_lifecycle)
+	{
+		const u64 probe_wait_after_us = m_frame_stats.zcull_query_wait_us;
+		const u64 probe_query_wait_us = probe_wait_after_us >= probe_wait_before_us ? probe_wait_after_us - probe_wait_before_us : 0;
+		record_perf_probe_zcull_lifecycle(*query, probe_frame_id, probe_get_entry_us, probe_submit_visible_us, probe_query_wait_us, probe_query_index_count);
+	}
 }
 
 void VKGSRender::discard_occlusion_query(rsx::reports::occlusion_query_info* query)

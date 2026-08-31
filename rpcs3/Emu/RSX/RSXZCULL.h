@@ -31,12 +31,28 @@ namespace rsx
 	{
 		struct occlusion_query_info
 		{
+			enum class perf_probe_age_hint_state : u8
+			{
+				none,
+				in_call,
+				flushed,
+				already_submitted,
+				no_indices,
+				no_occlusion_task,
+				backend_unobserved,
+			};
+
 			u32 driver_handle;
 			u32 result;
 			u32 num_draws;
 			u32 data_type;
 			u64 sync_tag;
 			u64 timestamp;
+			// Opt-in one-run probe state. These fields do not participate in query scheduling or results.
+			u64 perf_probe_enqueue_us;
+			u64 perf_probe_age_hint_us;
+			u64 perf_probe_first_zcull_flush_us;
+			perf_probe_age_hint_state perf_probe_age_hint = perf_probe_age_hint_state::none;
 			bool pending;
 			bool active;
 			bool owned;

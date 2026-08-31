@@ -156,17 +156,33 @@ namespace rsx
 			u64 wsi_wait_us;
 		};
 
+		struct zcull_lifecycle_record
+		{
+			u64 frame_id;
+			u32 driver_handle;
+			u8 age_hint_state;
+			s64 enqueue_to_age_hint_us;
+			s64 enqueue_to_get_us;
+			s64 age_hint_to_get_us;
+			s64 first_zcull_flush_to_get_us;
+			u64 get_to_submit_visible_us;
+			u64 query_wait_us;
+			u32 query_index_count;
+		};
+
 		explicit perf_probe_state(std::string path, std::string arm)
 			: output_path(std::move(path))
 			, arm_path(std::move(arm))
 		{
 			completed_frames.reserve(4096);
+			zcull_lifecycle_records.reserve(4096);
 		}
 
 		std::string output_path;
 		std::string arm_path;
 		std::mutex mutex;
 		std::vector<record> completed_frames;
+		std::vector<zcull_lifecycle_record> zcull_lifecycle_records;
 		std::vector<std::string> issues;
 		atomic_t<u64> next_frame_id{0};
 		u64 last_boundary_us = 0;
@@ -187,6 +203,8 @@ namespace rsx
 		bool offloader_snapshot_available = false;
 		bool offloader_output_committed = false;
 		bool offloader_output_failed = false;
+		bool zcull_lifecycle_output_committed = false;
+		bool zcull_lifecycle_output_failed = false;
 
 		void add_issue(std::string issue)
 		{
@@ -270,6 +288,76 @@ namespace rsx
 			records_written += completed_frames.size();
 			completed_frames.clear();
 			output_committed = true;
+			return true;
+		}
+
+		bool write_zcull_lifecycle()
+		{
+			if (zcull_lifecycle_output_committed)
+			{
+				return true;
+			}
+
+			if (zcull_lifecycle_output_failed)
+			{
+				return false;
+			}
+
+			auto state_name = [](u8 state) -> const char*
+			{
+				using state_type = reports::occlusion_query_info::perf_probe_age_hint_state;
+				switch (static_cast<state_type>(state))
+				{
+				case state_type::none: return "none";
+				case state_type::in_call: return "in_call";
+				case state_type::flushed: return "flushed";
+				case state_type::already_submitted: return "already_submitted";
+				case state_type::no_indices: return "no_indices";
+				case state_type::no_occlusion_task: return "no_occlusion_task";
+				case state_type::backend_unobserved: return "backend_unobserved";
+				default: return "invalid";
+				}
+			};
+
+			std::string payload;
+			payload.reserve(zcull_lifecycle_records.size() * 128 + 256);
+			payload += "frame_id,driver_handle,age_hint_outcome,enqueue_to_age_hint_us,enqueue_to_get_us,age_hint_to_get_us,first_zcull_flush_to_get_us,get_to_submit_visible_us,query_wait_us,query_index_count\n";
+
+			for (const auto& record : zcull_lifecycle_records)
+			{
+				payload += fmt::format(
+					"%llu,%u,%s,%lld,%lld,%lld,%lld,%llu,%llu,%u\n",
+					record.frame_id,
+					record.driver_handle,
+					state_name(record.age_hint_state),
+					record.enqueue_to_age_hint_us,
+					record.enqueue_to_get_us,
+					record.age_hint_to_get_us,
+					record.first_zcull_flush_to_get_us,
+					record.get_to_submit_visible_us,
+					record.query_wait_us,
+					record.query_index_count);
+			}
+
+			const std::string lifecycle_path = output_path + ".zcull-lifecycle.csv";
+			const std::string parent = fs::get_parent_dir(lifecycle_path);
+			if (!parent.empty() && !fs::create_path(parent) && fs::g_tls_error != fs::error::exist)
+			{
+				rsx_log.error("RSX ZCULL lifecycle probe failed to create output directory '%s': %s", parent, fs::g_tls_error);
+				zcull_lifecycle_output_failed = true;
+				return false;
+			}
+
+			fs::pending_file output(lifecycle_path);
+			if (!output.file || output.file.write(payload.data(), payload.size()) != payload.size() || !output.commit(false))
+			{
+				rsx_log.error("RSX ZCULL lifecycle probe failed to write '%s': %s", lifecycle_path, fs::g_tls_error);
+				zcull_lifecycle_output_failed = true;
+				return false;
+			}
+
+			zcull_lifecycle_records.clear();
+			zcull_lifecycle_output_committed = true;
 			return true;
 		}
 
@@ -427,7 +515,7 @@ namespace rsx
 				issue_list += fmt::format("\"%s\"", escape_json_string(issues[index]));
 			}
 
-			const bool valid = issues.empty() && !output_failed && !offloader_output_failed && offloader_output_committed && capture_completed;
+			const bool valid = issues.empty() && !output_failed && !offloader_output_failed && !zcull_lifecycle_output_failed && offloader_output_committed && zcull_lifecycle_output_committed && capture_completed;
 			const std::string payload = fmt::format(
 				"{\n  \"schemaVersion\": 1,\n  \"status\": \"%s\",\n  \"valid\": %s,\n  \"recordsWritten\": %llu,\n  \"issues\": [%s]\n}\n",
 				valid ? "complete" : "invalid",
@@ -3795,6 +3883,10 @@ namespace rsx
 		{
 			probe.add_issue("offloader_raw_output_failed");
 		}
+		if (!probe.write_zcull_lifecycle())
+		{
+			probe.add_issue("zcull_lifecycle_output_failed");
+		}
 
 		probe.finalized = probe.write_status();
 	}
@@ -3811,6 +3903,44 @@ namespace rsx
 		}
 
 		get_perf_probe_counter(m_frame_stats, field) += elapsed_us;
+	}
+
+	void thread::record_perf_probe_zcull_lifecycle(
+		const reports::occlusion_query_info& query,
+		u64 frame_id,
+		u64 get_entry_us,
+		u64 submit_visible_us,
+		u64 query_wait_us,
+		u32 query_index_count)
+	{
+		if (!m_perf_probe)
+		{
+			return;
+		}
+
+		auto& probe = *m_perf_probe;
+		std::lock_guard lock(probe.mutex);
+		if (!m_perf_probe_armed.load())
+		{
+			return;
+		}
+
+		auto delta_or_missing = [](u64 end, u64 start) -> s64
+		{
+			return start && end >= start ? static_cast<s64>(end - start) : -1;
+		};
+
+		probe.zcull_lifecycle_records.emplace_back(perf_probe_state::zcull_lifecycle_record{
+			frame_id,
+			query.driver_handle,
+			static_cast<u8>(query.perf_probe_age_hint),
+			delta_or_missing(query.perf_probe_age_hint_us, query.perf_probe_enqueue_us),
+			delta_or_missing(get_entry_us, query.perf_probe_enqueue_us),
+			delta_or_missing(get_entry_us, query.perf_probe_age_hint_us),
+			delta_or_missing(get_entry_us, query.perf_probe_first_zcull_flush_us),
+			submit_visible_us >= get_entry_us ? submit_visible_us - get_entry_us : 0,
+			query_wait_us,
+			query_index_count});
 	}
 
 	void thread::split_perf_probe_guest_wait_segment(u64 boundary_us)
@@ -4241,6 +4371,10 @@ namespace rsx
 					{
 						probe.add_issue("offloader_raw_output_failed");
 					}
+					if (!probe.write_zcull_lifecycle())
+					{
+						probe.add_issue("zcull_lifecycle_output_failed");
+					}
 
 					probe.finalized = probe.write_status();
 				}
@@ -4265,6 +4399,10 @@ namespace rsx
 					if (!probe.write_offloader_raw())
 					{
 						probe.add_issue("offloader_raw_output_failed");
+					}
+					if (!probe.write_zcull_lifecycle())
+					{
+						probe.add_issue("zcull_lifecycle_output_failed");
 					}
 					// The validity status is deliberately the last artifact. A failed
 					// begin is terminal for this one-run probe and must never be retried

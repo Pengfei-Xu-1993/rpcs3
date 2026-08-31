@@ -498,6 +498,13 @@ namespace rsx
 		void end_perf_probe_submit_frontend();
 		void begin_perf_probe_offloader_sync();
 		void end_perf_probe_offloader_sync();
+		void record_perf_probe_zcull_lifecycle(
+			const reports::occlusion_query_info& query,
+			u64 frame_id,
+			u64 get_entry_us,
+			u64 submit_visible_us,
+			u64 query_wait_us,
+			u32 query_index_count);
 
 	private:
 		void add_perf_probe_time_impl(perf_probe_field field, u64 elapsed_us);

@@ -60,6 +60,7 @@ namespace rsx
 						m_current_task->pending = true;
 						m_current_task->sync_tag = m_timer++;
 						m_current_task->timestamp = m_tsc;
+						m_current_task->perf_probe_enqueue_us = ptimer->perf_probe_enabled() ? get_system_time() : 0;
 
 						m_pending_writes.push_back({});
 						m_pending_writes.back().query = m_current_task;
@@ -142,6 +143,7 @@ namespace rsx
 				m_current_task->active = false;
 				m_current_task->pending = true;
 				m_current_task->timestamp = m_tsc;
+				m_current_task->perf_probe_enqueue_us = ptimer->perf_probe_enabled() ? get_system_time() : 0;
 				m_current_task->sync_tag = m_timer++;
 				m_pending_writes.back().query = m_current_task;
 
@@ -218,6 +220,10 @@ namespace rsx
 					m_current_task->owned = false;
 					m_current_task->sync_tag = 0;
 					m_current_task->timestamp = 0;
+					m_current_task->perf_probe_enqueue_us = 0;
+					m_current_task->perf_probe_age_hint_us = 0;
+					m_current_task->perf_probe_first_zcull_flush_us = 0;
+					m_current_task->perf_probe_age_hint = occlusion_query_info::perf_probe_age_hint_state::none;
 
 					// Flags determine what kind of payload is carried by queries in the 'report'
 					if (zpass_count_enabled) m_current_task->data_type |= CELL_GCM_ZPASS_PIXEL_CNT;
@@ -569,7 +575,20 @@ namespace rsx
 						const auto elapsed = m_tsc - front.query->timestamp;
 						if (elapsed > max_zcull_delay_us)
 						{
+							const bool probe_hint = ptimer->perf_probe_enabled();
+							if (probe_hint)
+							{
+								front.query->perf_probe_age_hint_us = m_tsc;
+								front.query->perf_probe_age_hint = occlusion_query_info::perf_probe_age_hint_state::in_call;
+							}
+
 							ptimer->sync_hint(FIFO::interrupt_hint::zcull_sync, { .query = front.query });
+
+							if (probe_hint && front.query->perf_probe_age_hint == occlusion_query_info::perf_probe_age_hint_state::in_call)
+							{
+								front.query->perf_probe_age_hint = occlusion_query_info::perf_probe_age_hint_state::backend_unobserved;
+							}
+
 							ensure(front.query->sync_tag <= m_sync_tag);
 						}
 
