@@ -398,21 +398,52 @@ namespace rsx
 		}
 	}
 
-	void dma_manager::record_probe_sync(u64 elapsed_cycles, bool fast) const
+	void dma_manager::record_probe_sync(u64 elapsed_cycles, bool fast, probe_sync_context context) const
 	{
 		auto& producer = m_thread->m_probe_producer;
+		const usz context_index = static_cast<usz>(context);
+		ensure(context_index < producer.sync_by_context.size());
+		auto& context_stats = producer.sync_by_context[context_index];
 		producer.sync_calls_rsx++;
+		context_stats.calls++;
 
 		if (fast)
 		{
 			producer.sync_fast_rsx++;
+			context_stats.fast++;
 			return;
 		}
 
+		const u64 elapsed_us = probe_cycles_to_us(elapsed_cycles);
 		producer.sync_slow_rsx++;
 		producer.sync_slow_cycles_total += elapsed_cycles;
 		producer.sync_slow_cycles_max = std::max(producer.sync_slow_cycles_max, elapsed_cycles);
-		producer.sync_slow_duration[get_duration_bucket(probe_cycles_to_us(elapsed_cycles))]++;
+		producer.sync_slow_duration[get_duration_bucket(elapsed_us)]++;
+		context_stats.slow++;
+		context_stats.slow_cycles_total += elapsed_cycles;
+		context_stats.slow_cycles_max = std::max(context_stats.slow_cycles_max, elapsed_cycles);
+		context_stats.slow_us_total += elapsed_us;
+		context_stats.slow_duration[get_duration_bucket(elapsed_us)]++;
+	}
+
+	void dma_manager::probe_record_gcm_label_branch(probe_gcm_label_branch branch) const
+	{
+		if (!m_probe_enabled.observe() || !is_probe_owner_thread()) [[likely]]
+		{
+			return;
+		}
+
+		const usz index = static_cast<usz>(branch);
+		ensure(index < m_thread->m_probe_producer.gcm_label_branches.size());
+		m_thread->m_probe_producer.gcm_label_branches[index]++;
+	}
+
+	void dma_manager::probe_record_gcm_label_same_value_early_return() const
+	{
+		if (m_probe_enabled.observe() && is_probe_owner_thread()) [[unlikely]]
+		{
+			m_thread->m_probe_producer.gcm_label_same_value_early_returns++;
+		}
 	}
 
 	// General transport
@@ -502,7 +533,7 @@ namespace rsx
 		return false;
 	}
 
-	bool dma_manager::sync() const
+	bool dma_manager::sync(probe_sync_context context) const
 	{
 		auto& _thr = *m_thread;
 		const u64 probe_epoch = m_probe_enabled.observe() && is_probe_owner_thread() ? m_probe_epoch : 0;
@@ -512,7 +543,7 @@ namespace rsx
 			// Nothing to do
 			if (probe_epoch) [[unlikely]]
 			{
-				record_probe_sync(0, true);
+				record_probe_sync(0, true, context);
 			}
 			return true;
 		}
@@ -538,7 +569,7 @@ namespace rsx
 			// and is censored instead of writing producer counters after end ack.
 			if (probe_epoch && m_probe_enabled.observe() && m_probe_epoch == probe_epoch) [[unlikely]]
 			{
-				record_probe_sync(utils::get_tsc() - probe_start_tsc, false);
+				record_probe_sync(utils::get_tsc() - probe_start_tsc, false, context);
 			}
 		}
 		else
@@ -686,6 +717,11 @@ namespace rsx
 		snapshot.worker_type_sum_matches = snapshot.worker_type_sum == snapshot.worker.processed_jobs;
 		snapshot.raw_integrity_matches = producer_raw == worker_raw &&
 			snapshot.producer.raw_queued_bytes == snapshot.worker.processed_raw_bytes;
+		for (const auto& context : snapshot.producer.sync_by_context)
+		{
+			snapshot.sync_context_sum += context.calls;
+		}
+		snapshot.sync_context_sum_matches = snapshot.sync_context_sum == snapshot.producer.sync_calls_rsx;
 		snapshot.transport_boundaries_match =
 			snapshot.begin_ack.enqueued > snapshot.begin_publish.enqueued &&
 			snapshot.begin_ack.processed > snapshot.begin_publish.processed &&
@@ -703,6 +739,7 @@ namespace rsx
 			difference(producer_raw, worker_raw) +
 			difference(snapshot.transport_window_jobs, snapshot.worker.processed_jobs) +
 			difference(snapshot.worker_type_sum, snapshot.worker.processed_jobs) +
+			difference(snapshot.sync_context_sum, snapshot.producer.sync_calls_rsx) +
 			snapshot.producer.empty_push_phase_unknown +
 			snapshot.producer.incomplete_draws;
 
@@ -712,6 +749,7 @@ namespace rsx
 			snapshot.transport_boundaries_match &&
 			snapshot.worker_type_sum_matches &&
 			snapshot.raw_integrity_matches &&
+			snapshot.sync_context_sum_matches &&
 			snapshot.producer.empty_push_phase_unknown == 0 &&
 			snapshot.producer.incomplete_draws == 0;
 

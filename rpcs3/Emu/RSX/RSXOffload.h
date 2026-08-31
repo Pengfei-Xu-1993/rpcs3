@@ -14,6 +14,36 @@ namespace rsx
 {
 	class dma_manager
 	{
+	public:
+		enum class probe_sync_context : u32
+		{
+			generic = 0,
+			gcm_texture_handled,
+			gcm_texture_fallback,
+			gcm_backend_handled,
+			gcm_backend_fallback,
+			frame_submit,
+			heap_grow,
+			wait_pause,
+			renderer_shutdown,
+		};
+
+		enum class probe_gcm_label_branch : u32
+		{
+			unsupported = 0,
+			texture_loads_completed,
+			texture_mapping_fallback,
+			backend_mapping_fallback,
+			texture_primary_command_buffer,
+			texture_secondary_command_buffer,
+			backend_primary_command_buffer,
+			backend_secondary_command_buffer,
+		};
+
+		static constexpr usz probe_sync_context_count = 9;
+		static constexpr usz probe_gcm_label_branch_count = 8;
+
+	private:
 		enum op
 		{
 			raw_copy = 0,
@@ -99,7 +129,7 @@ namespace rsx
 
 		bool is_probe_owner_thread() const;
 		void record_probe_raw_copy(u32 length, bool queued, bool queue_was_empty, u32 empty_push_phase) const;
-		void record_probe_sync(u64 elapsed_cycles, bool fast) const;
+		void record_probe_sync(u64 elapsed_cycles, bool fast, probe_sync_context context) const;
 
 	public:
 		enum class probe_worker_phase : u32
@@ -131,6 +161,17 @@ namespace rsx
 			u64 intervals{};
 			u64 arrivals_within_r{};
 			u64 projected_extra_busy_us{};
+		};
+
+		struct probe_sync_context_stats
+		{
+			u64 calls{};
+			u64 fast{};
+			u64 slow{};
+			u64 slow_cycles_total{};
+			u64 slow_cycles_max{};
+			u64 slow_us_total{};
+			std::array<u64, probe_duration_bucket_count> slow_duration{};
 		};
 
 		struct alignas(64) probe_producer_stats
@@ -167,6 +208,9 @@ namespace rsx
 			u64 sync_slow_cycles_total{};
 			u64 sync_slow_cycles_max{};
 			std::array<u64, probe_duration_bucket_count> sync_slow_duration{};
+			std::array<probe_sync_context_stats, probe_sync_context_count> sync_by_context{};
+			std::array<u64, probe_gcm_label_branch_count> gcm_label_branches{};
+			u64 gcm_label_same_value_early_returns{};
 		};
 
 		struct alignas(64) probe_worker_stats
@@ -211,6 +255,8 @@ namespace rsx
 			u64 worker_type_sum{};
 			bool worker_type_sum_matches{};
 			bool raw_integrity_matches{};
+			u64 sync_context_sum{};
+			bool sync_context_sum_matches{};
 			bool transport_boundaries_match{};
 			probe_transport_boundary begin_publish{};
 			probe_transport_boundary begin_ack{};
@@ -245,7 +291,7 @@ namespace rsx
 
 		// Synchronization
 		bool is_current_thread() const;
-		bool sync() const;
+		bool sync(probe_sync_context context = probe_sync_context::generic) const;
 		void join();
 		void set_mem_fault_flag();
 		void clear_mem_fault_flag();
@@ -258,6 +304,8 @@ namespace rsx
 		bool probe_is_enabled() const { return m_probe_enabled.observe(); }
 		probe_draw_token probe_begin_persistent_draw() const;
 		void probe_end_persistent_draw(probe_draw_token token, u32 blocks, u32 eligible_blocks, u64 eligible_bytes, bool complete = true) const;
+		void probe_record_gcm_label_branch(probe_gcm_label_branch branch) const;
+		void probe_record_gcm_label_same_value_early_return() const;
 		u32 probe_immediate_transfer_threshold() const { return max_immediate_transfer_size; }
 
 		// Fault recovery
