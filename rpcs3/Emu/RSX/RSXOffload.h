@@ -114,7 +114,7 @@ namespace rsx
 		std::shared_ptr<named_thread<offload_thread>> m_thread;
 
 		// TODO: Improved benchmarks here; value determined by profiling on a Ryzen CPU, rounded to the nearest 512 bytes
-		const u32 max_immediate_transfer_size = 32768;
+		const u32 max_immediate_transfer_size = 8192;
 
 		mutable atomic_t<bool> m_probe_enabled = false;
 		mutable bool m_probe_begin_pending = false;
