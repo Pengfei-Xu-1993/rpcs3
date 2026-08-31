@@ -804,7 +804,7 @@ VKGSRender::~VKGSRender()
 	}
 
 	// Flush DMA queue
-	while (!g_fxo->get<rsx::dma_manager>().sync())
+	while (!g_fxo->get<rsx::dma_manager>().sync(rsx::dma_manager::probe_sync_context::renderer_shutdown))
 	{
 		do_local_task(rsx::FIFO::state::lock_wait);
 	}
@@ -1021,6 +1021,7 @@ void VKGSRender::on_semaphore_acquire_wait()
 		(async_flip_requested & flip_request::emu_requested) ||
 		(m_queue_status & flush_queue_state::deadlock))
 	{
+		g_fxo->get<rsx::dma_manager>().probe_record_sync_local_task_service_hit();
 		do_local_task(rsx::FIFO::state::lock_wait);
 	}
 }
@@ -1583,15 +1584,20 @@ std::pair<volatile vk::host_data_t*, VkBuffer> VKGSRender::map_host_object_data(
 
 bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 {
+	auto& dma = g_fxo->get<rsx::dma_manager>();
+	const bool is_texture_label = type == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE;
+
 	if (!backend_config.supports_host_gpu_labels)
 	{
+		dma.probe_record_gcm_label_branch(rsx::dma_manager::probe_gcm_label_branch::unsupported);
 		return false;
 	}
 
 	auto host_ctx = ensure(m_host_dma_ctrl->host_ctx());
 
-	if (type == NV4097_TEXTURE_READ_SEMAPHORE_RELEASE && host_ctx->texture_loads_completed())
+	if (is_texture_label && host_ctx->texture_loads_completed())
 	{
+		dma.probe_record_gcm_label_branch(rsx::dma_manager::probe_gcm_label_branch::texture_loads_completed);
 		// All texture loads already seen by the host GPU
 		// Wait for all previously submitted labels to be flushed
 		m_host_dma_ctrl->drain_label_queue();
@@ -1603,6 +1609,9 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 
 	if (!dynamic_cast<vk::memory_block_host*>(mapping.second->memory.get()))
 	{
+		dma.probe_record_gcm_label_branch(is_texture_label
+			? rsx::dma_manager::probe_gcm_label_branch::texture_mapping_fallback
+			: rsx::dma_manager::probe_gcm_label_branch::backend_mapping_fallback);
 		// NVIDIA GPUs can disappoint when DMA blocks straddle VirtualAlloc boundaries.
 		// Take the L and try the fallback.
 		rsx_log.warning("Host label update at 0x%x was not possible.", address);
@@ -1616,11 +1625,17 @@ bool VKGSRender::release_GCM_label(u32 type, u32 address, u32 args)
 
 	if (host_ctx->has_unflushed_texture_loads())
 	{
+		dma.probe_record_gcm_label_branch(is_texture_label
+			? rsx::dma_manager::probe_gcm_label_branch::texture_primary_command_buffer
+			: rsx::dma_manager::probe_gcm_label_branch::backend_primary_command_buffer);
 		vkCmdUpdateBuffer(*m_current_command_buffer, mapping.second->value, mapping.first, 4, &write_data);
 		flush_command_queue();
 	}
 	else
 	{
+		dma.probe_record_gcm_label_branch(is_texture_label
+			? rsx::dma_manager::probe_gcm_label_branch::texture_secondary_command_buffer
+			: rsx::dma_manager::probe_gcm_label_branch::backend_secondary_command_buffer);
 		auto cmd = m_secondary_cb_list.next();
 		cmd->begin();
 		vkCmdUpdateBuffer(*cmd, mapping.second->value, mapping.first, 4, &write_data);
@@ -2447,7 +2462,7 @@ void VKGSRender::close_and_submit_command_buffer(
 	// Workaround for deadlock occuring during RSX offloader fault
 	// TODO: Restructure command submission infrastructure to avoid this condition
 	begin_perf_probe_offloader_sync();
-	const bool sync_success = g_fxo->get<rsx::dma_manager>().sync();
+	const bool sync_success = g_fxo->get<rsx::dma_manager>().sync(rsx::dma_manager::probe_sync_context::frame_submit);
 	end_perf_probe_offloader_sync();
 	const VkBool32 force_flush = !sync_success;
 

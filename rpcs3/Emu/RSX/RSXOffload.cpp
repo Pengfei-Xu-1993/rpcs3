@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <limits>
 #include <thread>
 #include "util/asm.hpp"
 
@@ -56,6 +57,63 @@ namespace rsx
 			return 8;
 		}
 
+		usz get_pending_job_bucket(u64 value)
+		{
+			if (value <= 4) return static_cast<usz>(value);
+			if (value <= 8) return 5;
+			if (value <= 16) return 6;
+			if (value <= 32) return 7;
+			if (value <= 64) return 8;
+			return 9;
+		}
+
+		void probe_saturating_add(u64& target, u64 value, bool& saturated)
+		{
+			constexpr u64 maximum = std::numeric_limits<u64>::max();
+			if (value > maximum - target)
+			{
+				target = maximum;
+				saturated = true;
+				return;
+			}
+
+			target += value;
+		}
+
+		void probe_saturating_add(u32& target, u64 value, bool& saturated)
+		{
+			constexpr u32 maximum = std::numeric_limits<u32>::max();
+			if (value > static_cast<u64>(maximum - target))
+			{
+				target = maximum;
+				saturated = true;
+				return;
+			}
+
+			target += static_cast<u32>(value);
+		}
+
+		void probe_saturating_increment(u64& target, bool& saturated)
+		{
+			probe_saturating_add(target, 1, saturated);
+		}
+
+		void probe_saturating_increment(u32& target, bool& saturated)
+		{
+			probe_saturating_add(target, 1, saturated);
+		}
+
+		u64 probe_monotonic_delta(u64 later, u64 earlier, bool& saturated)
+		{
+			if (later >= earlier)
+			{
+				return later - earlier;
+			}
+
+			saturated = true;
+			return std::numeric_limits<u64>::max();
+		}
+
 		u64 probe_cycles_to_us(u64 cycles)
 		{
 			static const u64 frequency = utils::get_tsc_freq();
@@ -82,6 +140,8 @@ namespace rsx
 			return 15;
 		}
 	}
+
+	thread_local dma_manager::probe_sync_call_stats* dma_manager::s_probe_sync_call_stats = nullptr;
 
 	struct dma_manager::offload_thread
 	{
@@ -398,21 +458,68 @@ namespace rsx
 		}
 	}
 
-	void dma_manager::record_probe_sync(u64 elapsed_cycles, bool fast) const
+	void dma_manager::record_probe_sync(u64 elapsed_cycles, bool fast, probe_sync_context context, const probe_sync_call_stats& call_stats) const
 	{
 		auto& producer = m_thread->m_probe_producer;
+		const usz context_index = static_cast<usz>(context);
+		ensure(context_index < producer.sync_by_context.size());
+		auto& context_stats = producer.sync_by_context[context_index];
 		producer.sync_calls_rsx++;
+		context_stats.calls++;
 
 		if (fast)
 		{
 			producer.sync_fast_rsx++;
+			context_stats.fast++;
 			return;
 		}
 
+		const u64 elapsed_us = probe_cycles_to_us(elapsed_cycles);
 		producer.sync_slow_rsx++;
 		producer.sync_slow_cycles_total += elapsed_cycles;
 		producer.sync_slow_cycles_max = std::max(producer.sync_slow_cycles_max, elapsed_cycles);
-		producer.sync_slow_duration[get_duration_bucket(probe_cycles_to_us(elapsed_cycles))]++;
+		producer.sync_slow_duration[get_duration_bucket(elapsed_us)]++;
+		context_stats.slow++;
+		context_stats.slow_cycles_total += elapsed_cycles;
+		context_stats.slow_cycles_max = std::max(context_stats.slow_cycles_max, elapsed_cycles);
+		context_stats.slow_us_total += elapsed_us;
+		context_stats.slow_duration[get_duration_bucket(elapsed_us)]++;
+		context_stats.counters_saturated |= call_stats.counters_saturated;
+		probe_saturating_increment(context_stats.entry_pending_jobs[get_pending_job_bucket(call_stats.entry_pending_jobs)], context_stats.counters_saturated);
+		probe_saturating_add(context_stats.zero_poll_slow_calls, call_stats.zero_poll_slow_calls, context_stats.counters_saturated);
+		probe_saturating_add(context_stats.jobs_retired_while_waiting, call_stats.jobs_retired_while_waiting, context_stats.counters_saturated);
+		probe_saturating_add(context_stats.jobs_enqueued_while_waiting, call_stats.jobs_enqueued_while_waiting, context_stats.counters_saturated);
+		probe_saturating_add(context_stats.poll_iterations, call_stats.poll_iterations, context_stats.counters_saturated);
+		probe_saturating_add(context_stats.polls_without_processed_change, call_stats.polls_without_processed_change, context_stats.counters_saturated);
+		probe_saturating_add(context_stats.local_task_service_hits, call_stats.local_task_service_hits, context_stats.counters_saturated);
+	}
+
+	void dma_manager::probe_record_gcm_label_branch(probe_gcm_label_branch branch) const
+	{
+		if (!m_probe_enabled.observe() || !is_probe_owner_thread()) [[likely]]
+		{
+			return;
+		}
+
+		const usz index = static_cast<usz>(branch);
+		ensure(index < m_thread->m_probe_producer.gcm_label_branches.size());
+		m_thread->m_probe_producer.gcm_label_branches[index]++;
+	}
+
+	void dma_manager::probe_record_gcm_label_same_value_early_return() const
+	{
+		if (m_probe_enabled.observe() && is_probe_owner_thread()) [[unlikely]]
+		{
+			m_thread->m_probe_producer.gcm_label_same_value_early_returns++;
+		}
+	}
+
+	void dma_manager::probe_record_sync_local_task_service_hit() const
+	{
+		if (s_probe_sync_call_stats) [[unlikely]]
+		{
+			probe_saturating_increment(s_probe_sync_call_stats->local_task_service_hits, s_probe_sync_call_stats->counters_saturated);
+		}
 	}
 
 	// General transport
@@ -502,17 +609,18 @@ namespace rsx
 		return false;
 	}
 
-	bool dma_manager::sync() const
+	bool dma_manager::sync(probe_sync_context context) const
 	{
 		auto& _thr = *m_thread;
 		const u64 probe_epoch = m_probe_enabled.observe() && is_probe_owner_thread() ? m_probe_epoch : 0;
+		probe_sync_call_stats call_stats{};
 
 		if (_thr.m_enqueued_count.load() <= _thr.m_processed_count.load()) [[likely]]
 		{
 			// Nothing to do
 			if (probe_epoch) [[unlikely]]
 			{
-				record_probe_sync(0, true);
+				record_probe_sync(0, true, context, call_stats);
 			}
 			return true;
 		}
@@ -527,10 +635,58 @@ namespace rsx
 
 			const u64 probe_start_tsc = probe_epoch ? utils::get_tsc() : 0;
 
-			while (_thr.m_enqueued_count.load() > _thr.m_processed_count.load())
+			if (probe_epoch) [[unlikely]]
 			{
-				rsxthr->on_semaphore_acquire_wait();
-				utils::pause();
+				const u64 entry_enqueued = _thr.m_enqueued_count.load();
+				const u64 entry_processed = _thr.m_processed_count.load();
+				call_stats.entry_pending_jobs = probe_monotonic_delta(entry_enqueued, entry_processed, call_stats.counters_saturated);
+				u64 observed_enqueued = entry_enqueued;
+				u64 observed_processed = entry_processed;
+				u64 previous_processed = entry_processed;
+				auto* const previous_call_stats = s_probe_sync_call_stats;
+				struct probe_sync_call_stats_scope
+				{
+					probe_sync_call_stats*& slot;
+					probe_sync_call_stats* const previous;
+
+					~probe_sync_call_stats_scope()
+					{
+						slot = previous;
+					}
+				};
+				const probe_sync_call_stats_scope restore_call_stats{s_probe_sync_call_stats, previous_call_stats};
+				s_probe_sync_call_stats = &call_stats;
+
+				for (;;)
+				{
+					observed_enqueued = _thr.m_enqueued_count.load();
+					observed_processed = _thr.m_processed_count.load();
+					if (observed_enqueued <= observed_processed)
+					{
+						break;
+					}
+
+					probe_saturating_increment(call_stats.poll_iterations, call_stats.counters_saturated);
+					if (observed_processed == previous_processed)
+					{
+						probe_saturating_increment(call_stats.polls_without_processed_change, call_stats.counters_saturated);
+					}
+					previous_processed = observed_processed;
+					rsxthr->on_semaphore_acquire_wait();
+					utils::pause();
+				}
+
+				call_stats.zero_poll_slow_calls = call_stats.poll_iterations == 0;
+				call_stats.jobs_retired_while_waiting = probe_monotonic_delta(observed_processed, entry_processed, call_stats.counters_saturated);
+				call_stats.jobs_enqueued_while_waiting = probe_monotonic_delta(observed_enqueued, entry_enqueued, call_stats.counters_saturated);
+			}
+			else
+			{
+				while (_thr.m_enqueued_count.load() > _thr.m_processed_count.load())
+				{
+					rsxthr->on_semaphore_acquire_wait();
+					utils::pause();
+				}
 			}
 
 			// on_semaphore_acquire_wait() can service a re-entrant flip. If that
@@ -538,7 +694,7 @@ namespace rsx
 			// and is censored instead of writing producer counters after end ack.
 			if (probe_epoch && m_probe_enabled.observe() && m_probe_epoch == probe_epoch) [[unlikely]]
 			{
-				record_probe_sync(utils::get_tsc() - probe_start_tsc, false);
+				record_probe_sync(utils::get_tsc() - probe_start_tsc, false, context, call_stats);
 			}
 		}
 		else
@@ -686,6 +842,30 @@ namespace rsx
 		snapshot.worker_type_sum_matches = snapshot.worker_type_sum == snapshot.worker.processed_jobs;
 		snapshot.raw_integrity_matches = producer_raw == worker_raw &&
 			snapshot.producer.raw_queued_bytes == snapshot.worker.processed_raw_bytes;
+		snapshot.sync_poll_counters_match = true;
+		for (const auto& context : snapshot.producer.sync_by_context)
+		{
+			snapshot.sync_context_sum += context.calls;
+			u64 entry_pending_sum = 0;
+			bool entry_pending_sum_saturated = false;
+			for (const u64 count : context.entry_pending_jobs)
+			{
+				probe_saturating_add(entry_pending_sum, count, entry_pending_sum_saturated);
+			}
+
+			const bool context_poll_counters_match = !entry_pending_sum_saturated &&
+				entry_pending_sum == context.slow &&
+				context.zero_poll_slow_calls <= context.slow &&
+				context.poll_iterations >= context.slow - context.zero_poll_slow_calls &&
+				context.polls_without_processed_change <= context.poll_iterations &&
+				context.local_task_service_hits <= context.poll_iterations;
+			if (!context_poll_counters_match)
+			{
+				snapshot.sync_poll_counters_match = false;
+			}
+			snapshot.sync_poll_counters_saturated |= context.counters_saturated || entry_pending_sum_saturated;
+		}
+		snapshot.sync_context_sum_matches = snapshot.sync_context_sum == snapshot.producer.sync_calls_rsx;
 		snapshot.transport_boundaries_match =
 			snapshot.begin_ack.enqueued > snapshot.begin_publish.enqueued &&
 			snapshot.begin_ack.processed > snapshot.begin_publish.processed &&
@@ -703,6 +883,9 @@ namespace rsx
 			difference(producer_raw, worker_raw) +
 			difference(snapshot.transport_window_jobs, snapshot.worker.processed_jobs) +
 			difference(snapshot.worker_type_sum, snapshot.worker.processed_jobs) +
+			difference(snapshot.sync_context_sum, snapshot.producer.sync_calls_rsx) +
+			!snapshot.sync_poll_counters_match +
+			snapshot.sync_poll_counters_saturated +
 			snapshot.producer.empty_push_phase_unknown +
 			snapshot.producer.incomplete_draws;
 
@@ -712,6 +895,9 @@ namespace rsx
 			snapshot.transport_boundaries_match &&
 			snapshot.worker_type_sum_matches &&
 			snapshot.raw_integrity_matches &&
+			snapshot.sync_context_sum_matches &&
+			snapshot.sync_poll_counters_match &&
+			!snapshot.sync_poll_counters_saturated &&
 			snapshot.producer.empty_push_phase_unknown == 0 &&
 			snapshot.producer.incomplete_draws == 0;
 
