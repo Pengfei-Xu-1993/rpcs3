@@ -20,8 +20,10 @@ recommended patches to combine.
 
 The common source lineage and exact experiment boundaries differ by branch.
 Do not infer that a later branch supersedes every earlier prototype. Consult the
-commit history and the separate performance-research repository for the
-available decision records.
+commit history and the published companion repositories:
+
+- [Ascension performance research lab](https://github.com/Pengfei-Xu-1993/rpcs3-gow-ascension-performance-lab)
+- [God of War mesh-fix sources](https://github.com/Pengfei-Xu-1993/rpcs3-god-of-war-mesh-fixes)
 
 All project-specific work listed here is covered by
 [AI_DISCLOSURE.md](AI_DISCLOSURE.md). Upstream RPCS3 and third-party code are
