@@ -46,6 +46,9 @@ have different evidence levels; the presence of code does not mean that every
 experiment improved performance or passed final validation. Several directions
 were explicitly rejected after measurement.
 
+The archived branch names, exact HEADs, scopes, and evidence labels are listed
+in [PROJECT_BRANCHES.md](PROJECT_BRANCHES.md).
+
 No commercial game files, firmware, decryption keys, savestates, caches, raw
 captures, NVIDIA DLSS SDK files, or prebuilt DLSS-enabled binaries are included.
 Users must provide their own legally obtained game data and any external SDKs.
