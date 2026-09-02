@@ -6,6 +6,13 @@ RPCS3
 
 The world's first free and open-source PlayStation 3 emulator/debugger, written in C++ for Windows, Linux, macOS and FreeBSD.
 
+> **Fork disclosure:** project-specific changes on the experimental `codex/*`
+> branches were implemented by OpenAI Codex under human direction. The human
+> owner directed and manually tested the work but did not write the added code.
+> See [AI_DISCLOSURE.md](AI_DISCLOSURE.md) for the exact scope, human role, and
+> limitations. This disclosure does not apply to upstream RPCS3 or third-party
+> code.
+
 You can find some basic information on our [**website**](https://rpcs3.net/). Game info is being populated on the [**Wiki**](https://wiki.rpcs3.net/).
 For discussion about this emulator, PS3 emulation, and game compatibility reports, please visit our [**forums**](https://forums.rpcs3.net) and our [**Discord server**](https://discord.gg/RPCS3).
 
