@@ -14,6 +14,9 @@
 #include "SPUThread.h"
 #include "SPUAnalyser.h"
 #include "SPUInterpreter.h"
+#include "AscensionLiveProbe.h"
+#include "AscensionMfcRouting.h"
+#include "AscensionSpuTaskProbe.h"
 #include <algorithm>
 #include <thread>
 
@@ -3898,11 +3901,15 @@ public:
 			{
 				bool added = false;
 				std::string& llvm_error = g_spu_llvm_compile_context->llvm_error;
+				std::string llvm_cache_path = m_spurt->get_cache_path();
+				llvm_cache_path += ascension::live_probe::bootstrap_enabled()
+					? ascension::live_probe::spu_debug_cache_directory
+					: std::string_view{"llvm/"};
 
 				if (g_cfg.core.spu_debug)
 				{
 					// Testing only
-					added = m_jit.try_add(std::move(_module), m_spurt->get_cache_path() + "llvm/", llvm_error);
+					added = m_jit.try_add(std::move(_module), llvm_cache_path, llvm_error);
 				}
 				else
 				{
@@ -3921,10 +3928,14 @@ public:
 			}
 			else
 			{
+				std::string llvm_cache_path = m_spurt->get_cache_path();
+				llvm_cache_path += ascension::live_probe::bootstrap_enabled()
+					? ascension::live_probe::spu_debug_cache_directory
+					: std::string_view{"llvm/"};
 				if (g_cfg.core.spu_debug)
 				{
 					// Testing only
-					m_jit.add(std::move(_module), m_spurt->get_cache_path() + "llvm/");
+					m_jit.add(std::move(_module), llvm_cache_path);
 				}
 				else
 				{
@@ -3934,10 +3945,14 @@ public:
 				m_jit.fin();
 			}
 #else
+			std::string llvm_cache_path = m_spurt->get_cache_path();
+			llvm_cache_path += ascension::live_probe::bootstrap_enabled()
+				? ascension::live_probe::spu_debug_cache_directory
+				: std::string_view{"llvm/"};
 			if (g_cfg.core.spu_debug)
 			{
 				// Testing only
-				m_jit.add(std::move(_module), m_spurt->get_cache_path() + "llvm/");
+				m_jit.add(std::move(_module), llvm_cache_path);
 			}
 			else
 			{
@@ -5138,6 +5153,16 @@ public:
 				}
 
 				bool must_use_cpp_functions = !!g_cfg.core.spu_accurate_dma;
+				if (ascension::live_probe::force_cpp_mfc_get(
+						static_cast<u8>(ci->getZExtValue()),
+						ascension::live_probe::bootstrap_enabled()))
+				{
+					// Constant GET/GETB/GETF normally become inline LLVM copies and
+					// bypass do_dma_transfer(). The isolated Live Probe process must
+					// route them through the recorder-capable C++ path. Do not use the
+					// runtime armed state here: this choice is cached with the JIT block.
+					must_use_cpp_functions = true;
+				}
 
 				if (u64 cmdh = ci->getZExtValue() & ~(MFC_BARRIER_MASK | MFC_FENCE_MASK | MFC_RESULT_MASK); g_cfg.core.rsx_fifo_accuracy || g_cfg.video.strict_rendering_mode || /*!g_use_rtm*/ true)
 				{
@@ -5221,6 +5246,29 @@ public:
 				case MFC_GETB_CMD:
 				case MFC_GETF_CMD:
 				{
+					// V12: observe only the one authenticated Ascension output-PUT
+					// instruction. The environment flag is immutable and evaluated
+					// while this SPU block is compiled, so ordinary RPCS3 blocks do
+					// not contain the callback at all. Passing r1/r86 as live SSA
+					// values avoids a full GPR spill and any synthetic STOP/JIT exit.
+					if (ascension::spu_task_probe::mfc_identity_enabled() &&
+						m_pos == ascension::spu_task_probe::task_mfc_put_pc &&
+						cmd == MFC_PUT_CMD)
+					{
+						call(
+							"ascension_observe_mfc_task_put",
+							&ascension::spu_task_probe::observe_mfc_put,
+							m_thread,
+							m_ir->getInt32(m_pos),
+							eal.value,
+							lsa.value,
+							zext<u32>(size).eval(m_ir),
+							m_ir->getInt32(static_cast<u32>(cmd)),
+							zext<u32>(tag).eval(m_ir),
+							eval(extract(get_reg_fixed<u32[4]>(1), 3)).value,
+							eval(extract(get_reg_fixed<u32[4]>(86), 3)).value);
+					}
+
 					// Try to obtain constant size
 					u64 csize = -1;
 
@@ -10213,9 +10261,100 @@ public:
 
 	void BRSL(spu_opcode_t op) //
 	{
-		set_link(op);
-
 		const u32 target = spu_branch_target(m_pos, op.i16);
+
+		// The Live Probe cache contains one runtime gate at the verified task
+		// call. It records no payload and makes no host call while disarmed.
+		if (!m_interp_magn && ascension::live_probe::bootstrap_enabled() &&
+			m_pos == ascension::spu_task_probe::task_call_pc &&
+			target == ascension::spu_task_probe::task_dma_target_pc)
+		{
+			const auto task_header_lsa = eval(extract(get_reg_fixed<u32[4]>(84), 3));
+			const auto task_context_lsa = eval(extract(get_reg_fixed<u32[4]>(90), 3));
+			const auto dma_descriptor_lsa = eval(extract(get_reg_fixed<u32[4]>(95), 3));
+			auto* gate = call(
+				ascension::live_probe::runtime_gate_helper_symbol,
+				&ascension::live_probe::runtime_gate_value);
+			const auto publish = llvm::BasicBlock::Create(m_context, "ascension.live_probe.spu.publish", m_function);
+			const auto next = llvm::BasicBlock::Create(m_context, "ascension.live_probe.spu.next", m_function);
+			m_ir->CreateCondBr(
+				m_ir->CreateICmpNE(m_ir->CreateAnd(gate, m_ir->getInt64(1ull << 63)), m_ir->getInt64(0)),
+				publish,
+				next,
+				m_md_unlikely);
+
+			m_ir->SetInsertPoint(publish);
+			const auto register_type = llvm::ArrayType::get(get_type<u32>(), 128);
+			llvm::IRBuilder<> entry_builder(&m_function->getEntryBlock(), m_function->getEntryBlock().begin());
+			const auto registers = entry_builder.CreateAlloca(register_type);
+			for (u32 reg = 0; reg < 128; ++reg)
+			{
+				const auto address = m_ir->CreateInBoundsGEP(
+					register_type,
+					registers,
+					{m_ir->getInt32(0), m_ir->getInt32(reg)});
+				m_ir->CreateStore(extract(get_reg_fixed<u32[4]>(reg), 3).eval(m_ir), address);
+			}
+			call(
+				"ascension_live_probe_spu_task",
+				&ascension::live_probe::observe_spu_task,
+				m_thread,
+				m_ir->getInt32(m_pos),
+				m_ir->getInt32(target),
+				task_header_lsa.value,
+				task_context_lsa.value,
+				dma_descriptor_lsa.value,
+				registers);
+			m_ir->CreateBr(next);
+			m_ir->SetInsertPoint(next);
+		}
+
+		// BCAS25016 v1.12: keep the original BRSL and observe only verified
+		// character tasks. The task-format comparison is generated directly in
+		// the SPU JIT, so the overwhelmingly more common unrelated jobs never
+		// cross into a host callback and never force a GPR spill/JIT exit.
+		if (!m_interp_magn && ascension::spu_task_probe::mfc_identity_enabled() &&
+			m_pos == ascension::spu_task_probe::task_call_pc &&
+			target == ascension::spu_task_probe::task_dma_target_pc)
+		{
+			const auto task_header_lsa = eval(extract(get_reg_fixed<u32[4]>(84), 3));
+			const auto task_context_lsa = eval(extract(get_reg_fixed<u32[4]>(90), 3));
+			const auto dma_descriptor_lsa = eval(extract(get_reg_fixed<u32[4]>(95), 3));
+			const auto check_format = llvm::BasicBlock::Create(m_context, "ascension.identity.check", m_function);
+			const auto publish = llvm::BasicBlock::Create(m_context, "ascension.identity.publish", m_function);
+			const auto next = llvm::BasicBlock::Create(m_context, "ascension.identity.next", m_function);
+
+			m_ir->CreateCondBr(
+				m_ir->CreateICmpULE(task_context_lsa.value, m_ir->getInt32(0x3fff4)),
+				check_format,
+				next,
+				m_md_likely);
+			m_ir->SetInsertPoint(check_format);
+			const auto raw_format = spu_mem_attr(m_ir->CreateLoad(
+				get_type<u32>(),
+				_ptr(m_lsptr, m_ir->CreateZExt(task_context_lsa.value, get_type<u64>()))));
+			const auto task_format = m_ir->CreateCall(get_intrinsic<u32>(llvm::Intrinsic::bswap), {raw_format});
+			m_ir->CreateCondBr(
+				m_ir->CreateICmpEQ(task_format, m_ir->getInt32(ascension::spu_task_probe::character_task_format)),
+				publish,
+				next,
+				m_md_unlikely);
+
+			m_ir->SetInsertPoint(publish);
+			call(
+				"ascension_observe_task_call",
+				&ascension::spu_task_probe::observe_task_call,
+				m_thread,
+				m_ir->getInt32(m_pos),
+				m_ir->getInt32(target),
+				task_header_lsa.value,
+				task_context_lsa.value,
+				dma_descriptor_lsa.value);
+			m_ir->CreateBr(next);
+			m_ir->SetInsertPoint(next);
+		}
+
+		set_link(op);
 
 		if (m_finfo && m_finfo->fn && target != m_pos + 4)
 		{

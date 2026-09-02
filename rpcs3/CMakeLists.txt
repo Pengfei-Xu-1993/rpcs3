@@ -34,6 +34,8 @@ endif()
 # subdirectories
 add_subdirectory(Emu)
 
+# Developer-only utility for inspecting the persistent SPU block cache. It is
+# excluded from normal builds and does not ship with RPCS3.
 if (NOT ANDROID)
     add_subdirectory(rpcs3qt)
 endif()
@@ -43,6 +45,9 @@ gen_git_version(${CMAKE_CURRENT_SOURCE_DIR})
 if (NOT ANDROID)
     # Build rpcs3_lib
     add_library(rpcs3_lib STATIC)
+
+	add_executable(spu_cache_disasm EXCLUDE_FROM_ALL tools/spu_cache_disasm.cpp)
+	target_link_libraries(spu_cache_disasm PRIVATE rpcs3_lib)
 
     if(WIN32)
         target_compile_definitions(rpcs3_lib PRIVATE UNICODE _UNICODE)
@@ -119,6 +124,15 @@ if (NOT ANDROID)
         PRIVATE
             rpcs3_lib
     )
+
+    if(TARGET 3rdparty::nvidia_dlss)
+        add_custom_command(TARGET rpcs3 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<IF:$<CONFIG:Debug>,${NVIDIA_DLSS_RUNTIME_DEBUG},${NVIDIA_DLSS_RUNTIME_RELEASE}>"
+                "$<TARGET_FILE_DIR:rpcs3>/nvngx_dlss.dll"
+            COMMENT "Copying the NVIDIA DLSS runtime"
+        )
+    endif()
 
     if(USE_PRECOMPILED_HEADERS)
         target_precompile_headers(rpcs3 PRIVATE stdafx.h)

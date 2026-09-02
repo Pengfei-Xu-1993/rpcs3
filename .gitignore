@@ -126,3 +126,7 @@ CMakeUserPresets.json
 
 .cache/
 .lldbinit
+
+# Python tooling
+__pycache__/
+*.py[cod]

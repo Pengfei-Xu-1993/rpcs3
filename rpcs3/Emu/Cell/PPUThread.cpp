@@ -20,6 +20,7 @@
 #include "PPUAnalyser.h"
 #include "PPUModule.h"
 #include "PPUDisAsm.h"
+#include "AscensionLiveProbe.h"
 #include "SPURecompiler.h"
 #include "timers.hpp"
 #include "lv2/sys_sync.h"
@@ -2427,6 +2428,7 @@ ppu_thread::ppu_thread(const ppu_thread_params& param, std::string_view name, u3
 	, is_interrupt_thread(detached < 0)
 	, ppu_tname(make_single<std::string>(name))
 {
+	ascension_live_probe_gate = ascension::live_probe::ppu_gate_address();
 	prio.raw().prio = _prio;
 
 	memset(&hv_ctx, 0, sizeof(hv_ctx));
@@ -2522,6 +2524,7 @@ ppu_thread::ppu_thread(utils::serial& ar)
 	, entry_func(std::bit_cast<ppu_func_opd_t>(ar.pop<u64>()))
 	, is_interrupt_thread(ar)
 {
+	ascension_live_probe_gate = ascension::live_probe::ppu_gate_address();
 	[[maybe_unused]] const s32 version = GET_SERIALIZATION_VERSION(ppu);
 
 	struct init_pushed
@@ -4570,6 +4573,7 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 			{ "__escape", reinterpret_cast<u64>(+ppu_escape) },
 			{ "__read_maybe_mmio32", reinterpret_cast<u64>(+ppu_read_mmio_aware_u32) },
 			{ "__write_maybe_mmio32", reinterpret_cast<u64>(+ppu_write_mmio_aware_u32) },
+			{ "__ascension_live_probe_ppu_call", reinterpret_cast<u64>(+ascension::live_probe::observe_ppu_call) },
 		};
 
 		for (u64 index = 0; index < 1024; index++)
@@ -4603,6 +4607,15 @@ bool ppu_initialize(const ppu_module<lv2_obj>& info, bool check_only, u64 file_s
 		{
 			fmt::throw_exception("Failed to create cache directory: %s (%s)", cache_path, fs::g_tls_error);
 		}
+	}
+
+	if (ascension::live_probe::bootstrap_enabled() &&
+		info.path.ends_with("GOWA.SELF") &&
+		!cache_path.ends_with(ascension::live_probe::ppu_cache_directory))
+	{
+		cache_path += ascension::live_probe::ppu_cache_directory;
+		if (!fs::create_path(cache_path))
+			fmt::throw_exception("Failed to create Live Probe cache directory: %s (%s)", cache_path, fs::g_tls_error);
 	}
 
 #ifdef LLVM_AVAILABLE

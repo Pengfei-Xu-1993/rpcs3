@@ -5,6 +5,7 @@
 #include "Emu/Cell/SPUInterpreter.h"
 #include "Emu/Memory/vm.h"
 #include "MFC.h"
+#include "AscensionMfcProvenance.h"
 
 #include "util/v128.hpp"
 #include "util/logs.hpp"
@@ -971,6 +972,15 @@ public:
 			return static_cast<std::conditional_t<std::is_void_v<Func>, Func, decltype(_this->group)>>(_this->group)->prio.atomic_op(std::move(func));
 		}
 	} prio{ this };
+
+	// Append-only diagnostic state for the authorized Ascension Live Probe.
+	// Keeping this at the end preserves every existing spu_thread member offset,
+	// including offsets embedded in persistent SPU JIT objects.
+	// Sixteen-byte LS slots retain the last observed linear guest-EA mapping
+	// until those bytes are overwritten by another recorded GET or a new ARM
+	// epoch begins. This avoids eviction by unrelated DMA traffic while keeping
+	// the armed hot path fixed-capacity and allocation-free.
+	ascension::live_probe::mfc_get_provenance_table<SPU_LS_SIZE, RAW_SPU_BASE_ADDR> ascension_mfc_get_provenance{};
 };
 
 class spu_function_logger

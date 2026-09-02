@@ -6,6 +6,7 @@
 #include "PPUTranslator.h"
 #include "PPUThread.h"
 #include "SPUThread.h"
+#include "AscensionLiveProbe.h"
 
 #include "util/types.hpp"
 #include "util/endian.hpp"
@@ -31,6 +32,7 @@ extern const ppu_decoder<ppu_iname> g_ppu_iname;
 PPUTranslator::PPUTranslator(LLVMContext& context, Module* _module, const ppu_module<lv2_obj>& info, ExecutionEngine& engine)
 	: cpu_translator(_module, false)
 	, m_info(info)
+	, m_ascension_live_probe_module(ascension::live_probe::bootstrap_enabled() && info.path.ends_with("GOWA.SELF"))
 	, m_pure_attr()
 {
 	// Bind context
@@ -653,6 +655,42 @@ void PPUTranslator::CallFunction(u64 target, Value* indirect)
 	c->setTailCallKind(llvm::CallInst::TCK_Tail);
 	c->setCallingConv(CallingConv::GHC);
 	m_ir->CreateRetVoid();
+}
+
+void PPUTranslator::EmitAscensionLiveProbeCall(Value* target, Value* caller_lr)
+{
+	if (!m_ascension_live_probe_module)
+		return;
+
+	// Persistent objects keep only the ppu_thread field offset. Each thread is
+	// initialized with the current process' gate pointer, so ASLR and heap
+	// allocation cannot leave a stale host address in the object cache.
+	auto* thread_bytes = m_ir->CreateBitCast(m_thread, get_type<u8*>());
+	auto* gate_slot_bytes = m_ir->CreateInBoundsGEP(
+		get_type<u8>(),
+		thread_bytes,
+		m_ir->getInt64(offset32(&ppu_thread::ascension_live_probe_gate)));
+	auto* gate_slot = m_ir->CreateBitCast(gate_slot_bytes, get_type<u64**>());
+	auto* gate_pointer = m_ir->CreateLoad(get_type<u64*>(), gate_slot);
+	gate_pointer->setAlignment(Align(alignof(std::atomic<u64>*)));
+	auto* gate = m_ir->CreateLoad(get_type<u64>(), gate_pointer);
+	gate->setAtomic(AtomicOrdering::Acquire);
+	gate->setAlignment(Align(8));
+
+	const auto publish = BasicBlock::Create(m_context, "ascension.live_probe.ppu.publish", m_function);
+	const auto next = BasicBlock::Create(m_context, "ascension.live_probe.ppu.next", m_function);
+	const u64 expected = (1ull << 63) | static_cast<u32>(m_addr);
+	m_ir->CreateCondBr(m_ir->CreateICmpEQ(gate, m_ir->getInt64(expected)), publish, next, m_md_unlikely);
+	m_ir->SetInsertPoint(publish);
+	Call(
+		GetType<void>(),
+		"__ascension_live_probe_ppu_call",
+		m_thread,
+		m_ir->getInt32(static_cast<u32>(m_addr)),
+		Trunc(target, get_type<u32>()),
+		caller_lr);
+	m_ir->CreateBr(next);
+	m_ir->SetInsertPoint(next);
 }
 
 Value* PPUTranslator::RegInit(Value*& local)
@@ -2294,6 +2332,8 @@ void PPUTranslator::BC(ppu_opcode_t op)
 {
 	const s32 bt14 = op.bt14; // Workaround for VS 16.5
 	const u64 target = (op.aa ? 0 : m_addr) + bt14;
+	Value* const caller_lr = op.lk && m_ascension_live_probe_module
+		? RegLoad(m_lr) : nullptr;
 
 	if (op.aa && m_reloc)
 	{
@@ -2306,6 +2346,8 @@ void PPUTranslator::BC(ppu_opcode_t op)
 	}
 
 	UseCondition(CheckBranchProbability(op.bo), CheckBranchCondition(op.bo, op.bi));
+	if (caller_lr)
+		EmitAscensionLiveProbeCall(m_ir->getInt64(target), caller_lr);
 
 	CallFunction(target);
 }
@@ -2344,6 +2386,8 @@ void PPUTranslator::B(ppu_opcode_t op)
 {
 	const s32 bt24 = op.bt24; // Workaround for VS 16.5
 	const u64 target = (op.aa ? 0 : m_addr) + bt24;
+	Value* const caller_lr = op.lk && m_ascension_live_probe_module
+		? RegLoad(m_lr) : nullptr;
 
 	if (op.aa && m_reloc)
 	{
@@ -2356,6 +2400,8 @@ void PPUTranslator::B(ppu_opcode_t op)
 	}
 
 	FlushRegisters();
+	if (caller_lr)
+		EmitAscensionLiveProbeCall(m_ir->getInt64(target), caller_lr);
 	CallFunction(target);
 }
 
@@ -2371,6 +2417,8 @@ void PPUTranslator::MCRF(ppu_opcode_t op)
 void PPUTranslator::BCLR(ppu_opcode_t op)
 {
 	const auto target = RegLoad(m_lr);
+	Value* const caller_lr = op.lk && m_ascension_live_probe_module
+		? target : nullptr;
 
 	if (op.lk)
 	{
@@ -2378,6 +2426,8 @@ void PPUTranslator::BCLR(ppu_opcode_t op)
 	}
 
 	UseCondition(CheckBranchProbability(op.bo), CheckBranchCondition(op.bo, op.bi));
+	if (caller_lr)
+		EmitAscensionLiveProbeCall(target, caller_lr);
 
 	CallFunction(0, target);
 }
@@ -2434,6 +2484,8 @@ void PPUTranslator::CROR(ppu_opcode_t op)
 void PPUTranslator::BCCTR(ppu_opcode_t op)
 {
 	const auto target = RegLoad(m_ctr);
+	Value* const caller_lr = op.lk && m_ascension_live_probe_module
+		? RegLoad(m_lr) : nullptr;
 
 	if (op.lk)
 	{
@@ -2441,6 +2493,8 @@ void PPUTranslator::BCCTR(ppu_opcode_t op)
 	}
 
 	UseCondition(CheckBranchProbability(op.bo | 0x4), CheckBranchCondition(op.bo | 0x4, op.bi));
+	if (caller_lr)
+		EmitAscensionLiveProbeCall(target, caller_lr);
 
 	CallFunction(0, target);
 }

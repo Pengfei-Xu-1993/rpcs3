@@ -19,6 +19,8 @@
 
 #include "Emu/Cell/SPUDisAsm.h"
 #include "Emu/Cell/SPUAnalyser.h"
+#include "Emu/Cell/AscensionLiveProbe.h"
+#include "Emu/Cell/AscensionSpuTaskProbe.h"
 #include "Emu/Cell/SPUThread.h"
 #include "Emu/Cell/SPURecompiler.h"
 #include "Emu/Cell/timers.hpp"
@@ -2294,6 +2296,10 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 					dump.block_hash = _this->block_hash;
 					std::memcpy(dump.data, is_get ? dst : src, std::min<u32>(args.size, 128));
 				}
+				if (is_get)
+				{
+					ascension::live_probe::record_spu_mfc_get(_this, lsa, args.eal, args.size);
+				}
 
 				return;
 			}
@@ -2492,6 +2498,10 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 				dump.cmd.eah = _this->pc;
 				dump.block_hash = _this->block_hash;
 				std::memcpy(dump.data, is_get ? dst : src, std::min<u32>(args.size, 128));
+			}
+			if (is_get)
+			{
+				ascension::live_probe::record_spu_mfc_get(_this, lsa, args.eal, args.size);
 			}
 
 			return;
@@ -2697,6 +2707,10 @@ void spu_thread::do_dma_transfer(spu_thread* _this, const spu_mfc_cmd& args, u8*
 			dump.block_hash = _this->block_hash;
 			std::memcpy(dump.data, is_get ? dst : src, std::min<u32>(args.size, 128));
 		}
+		if (is_get)
+		{
+			ascension::live_probe::record_spu_mfc_get(_this, lsa, args.eal, args.size);
+		}
 
 		return;
 	}
@@ -2773,6 +2787,10 @@ plain_access:
 		dump.cmd.eah = _this->pc;
 		dump.block_hash = _this->block_hash;
 		std::memcpy(dump.data, is_get ? dst : src, std::min<u32>(args.size, 128));
+	}
+	if (is_get)
+	{
+		ascension::live_probe::record_spu_mfc_get(_this, lsa, args.eal, args.size);
 	}
 }
 
@@ -2859,6 +2877,14 @@ bool spu_thread::do_list_transfer(spu_mfc_cmd& args)
 	u8 optimization_compatible = transfer.cmd & (MFC_GET_CMD | MFC_PUT_CMD);
 
 	if (spu_log.trace || g_cfg.core.spu_accurate_dma || g_cfg.core.mfc_debug)
+	{
+		optimization_compatible = 0;
+	}
+
+	// Both the six-item and single-item GET-list fast paths bypass
+	// do_dma_transfer(). Route an authorized, armed probe through the shared
+	// runtime transfer path so dynamic list arguments receive provenance too.
+	if (optimization_compatible == MFC_GET_CMD && ascension::live_probe::mfc_provenance_enabled())
 	{
 		optimization_compatible = 0;
 	}
@@ -4272,6 +4298,7 @@ bool spu_thread::process_mfc_cmd()
 			raddr = last_faddr;
 			last_ftime = 0;
 			mov_rdata(_ref<spu_rdata_t>(ch_mfc_cmd.lsa & 0x3ff80), rdata);
+			ascension::live_probe::record_spu_mfc_get(this, ch_mfc_cmd.lsa & 0x3ff80, addr, 128);
 
 			ch_atomic_stat.set_value(MFC_GETLLAR_SUCCESS);
 			return true;
@@ -4301,6 +4328,7 @@ bool spu_thread::process_mfc_cmd()
 				if (this_time % 128 == 0 && cmp_rdata(rdata, data))
 				{
 					mov_rdata(_ref<spu_rdata_t>(ch_mfc_cmd.lsa & 0x3ff80), rdata);
+					ascension::live_probe::record_spu_mfc_get(this, ch_mfc_cmd.lsa & 0x3ff80, addr, 128);
 					ch_atomic_stat.set_value(MFC_GETLLAR_SUCCESS);
 
 					// Need to check twice for it to be accurate, the code is before and not after this check for:
@@ -4607,6 +4635,7 @@ bool spu_thread::process_mfc_cmd()
 		raddr = addr;
 		rtime = ntime;
 		mov_rdata(_ref<spu_rdata_t>(ch_mfc_cmd.lsa & 0x3ff80), rdata);
+		ascension::live_probe::record_spu_mfc_get(this, ch_mfc_cmd.lsa & 0x3ff80, addr, 128);
 
 		ch_atomic_stat.set_value(MFC_GETLLAR_SUCCESS);
 
@@ -6494,6 +6523,13 @@ extern void resume_spu_thread_group_from_waiting(spu_thread& spu, std::array<sha
 
 bool spu_thread::stop_and_signal(u32 code)
 {
+	if (ascension::spu_task_probe::handle_stop(*this, code))
+	{
+		// The probe emulated the overwritten BRSL and selected the call target.
+		// Returning false makes every SPU backend redispatch at that PC.
+		return false;
+	}
+
 	auto set_status_npc = [&]()
 	{
 		status_npc.atomic_op([&](status_npc_sync_var& state)
